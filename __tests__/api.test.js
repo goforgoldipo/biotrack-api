@@ -250,9 +250,9 @@ describe("GET /history", () => {
     const r = await get("/history?days=7");
     expect(r.body.snapshots.length).toBeLessThanOrEqual(7);
   });
-  test("?days=999 caps at 90", async () => {
-    const r = await get("/history?days=999");
-    expect(r.body.days).toBeLessThanOrEqual(90);
+  test("?days=9999 caps at 3650", async () => {
+    const r = await get("/history?days=9999");
+    expect(r.body.days).toBeLessThanOrEqual(3650);
   });
   test("default days=30", async () => {
     const r = await get("/history");

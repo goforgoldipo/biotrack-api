@@ -99,7 +99,7 @@ app.get("/latest", auth, (req, res) => {
 
 // GET /history?days=30 — last N days of snapshots
 app.get("/history", auth, (req, res) => {
-  const days = Math.min(parseInt(req.query.days) || 30, 90);
+  const days = Math.min(parseInt(req.query.days) || 30, 3650);
   const { history } = load();
 
   // Deduplicate by date — keep newest per day
