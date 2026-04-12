@@ -124,13 +124,23 @@ app.get("/history", auth, (req, res) => {
     return { ...snap, _dateKey: dateKey };
   });
 
-  // Deduplicate by date — keep snapshot with the MOST data fields per day
-  const fieldCount = (s) => Object.keys(s).filter(k => !k.startsWith("_") && s[k] !== null && s[k] !== undefined && s[k] !== "").length;
+  // Merge all snapshots for the same day — combine data from all sources
   const byDate = {};
   for (const snap of withDates) {
     const key = snap._dateKey;
-    if (!byDate[key] || fieldCount(snap) > fieldCount(byDate[key])) {
-      byDate[key] = snap;
+    if (!byDate[key]) {
+      byDate[key] = { ...snap };
+    } else {
+      // Merge: for each field, keep the non-null value (prefer newer if both have data)
+      for (const [k, v] of Object.entries(snap)) {
+        if (k.startsWith("_")) continue; // skip internal fields
+        if (v !== null && v !== undefined && v !== "" && v !== 0) {
+          const existing = byDate[key][k];
+          if (existing === null || existing === undefined || existing === "" || existing === 0) {
+            byDate[key][k] = v;
+          }
+        }
+      }
     }
   }
 
