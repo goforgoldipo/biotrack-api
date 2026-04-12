@@ -124,11 +124,12 @@ app.get("/history", auth, (req, res) => {
     return { ...snap, _dateKey: dateKey };
   });
 
-  // Deduplicate by date — keep newest per day
+  // Deduplicate by date — keep snapshot with the MOST data fields per day
+  const fieldCount = (s) => Object.keys(s).filter(k => !k.startsWith("_") && s[k] !== null && s[k] !== undefined && s[k] !== "").length;
   const byDate = {};
   for (const snap of withDates) {
     const key = snap._dateKey;
-    if (!byDate[key] || snap._receivedAt > byDate[key]._receivedAt) {
+    if (!byDate[key] || fieldCount(snap) > fieldCount(byDate[key])) {
       byDate[key] = snap;
     }
   }
