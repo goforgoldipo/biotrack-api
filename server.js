@@ -99,18 +99,41 @@ app.get("/latest", auth, (req, res) => {
 
 // GET /history?days=30 — last N days of snapshots
 app.get("/history", auth, (req, res) => {
-  const days = Math.min(parseInt(req.query.days) || 30, 3650);
+  const days = Math.min(parseInt(req.query.days) || 30, 20000);
   const { history } = load();
+
+  // Parse each snapshot's actual date from _receivedAt or syncDate
+  const withDates = history.map(snap => {
+    let dateKey;
+    if (snap._receivedAt) {
+      dateKey = snap._receivedAt.slice(0, 10); // "2026-04-12"
+    } else if (snap.syncDate) {
+      // Parse "Apr 12" — assume current year, adjust if in future
+      const parsed = new Date(snap.syncDate + ", " + new Date().getFullYear());
+      if (parsed > new Date()) parsed.setFullYear(parsed.getFullYear() - 1);
+      dateKey = parsed.toISOString().slice(0, 10);
+    } else {
+      dateKey = "unknown";
+    }
+    return { ...snap, _dateKey: dateKey };
+  });
 
   // Deduplicate by date — keep newest per day
   const byDate = {};
-  for (const snap of history) {
-    const key = snap.syncDate || snap._receivedAt?.slice(0,10) || "unknown";
-    if (!byDate[key]) byDate[key] = snap;
+  for (const snap of withDates) {
+    const key = snap._dateKey;
+    if (!byDate[key] || snap._receivedAt > byDate[key]._receivedAt) {
+      byDate[key] = snap;
+    }
   }
-  const deduped = Object.values(byDate).slice(0, days);
 
-  res.json({ count: deduped.length, days, snapshots: deduped });
+  // Sort by date descending (newest first) and limit
+  const sorted = Object.values(byDate)
+    .sort((a, b) => (b._dateKey || "").localeCompare(a._dateKey || ""))
+    .slice(0, days)
+    .map(({ _dateKey, ...rest }) => rest); // remove internal field
+
+  res.json({ count: sorted.length, days, snapshots: sorted });
 });
 
 // GET /stats — aggregate summary for dashboard
