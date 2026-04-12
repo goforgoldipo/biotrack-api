@@ -80,7 +80,7 @@ app.post("/sync", auth, (req, res) => {
 
   // Cap history at 90 snapshots (not 90 unique days — keeps every sync)
   state.history.unshift(snap);
-  if (state.history.length > 360) state.history = state.history.slice(0, 360);
+  if (state.history.length > 3650) state.history = state.history.slice(0, 3650);
 
   save(state);
 
