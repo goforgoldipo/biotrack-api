@@ -102,18 +102,24 @@ app.get("/history", auth, (req, res) => {
   const days = Math.min(parseInt(req.query.days) || 30, 20000);
   const { history } = load();
 
-  // Parse each snapshot's actual date from _receivedAt or syncDate
+  // Parse each snapshot's actual data date from syncDate
+  // syncDate is "Apr 12" — the actual date the health data is for
+  // _receivedAt is when it was posted (could be bulk import)
   const withDates = history.map(snap => {
-    let dateKey;
-    if (snap._receivedAt) {
-      dateKey = snap._receivedAt.slice(0, 10); // "2026-04-12"
-    } else if (snap.syncDate) {
-      // Parse "Apr 12" — assume current year, adjust if in future
-      const parsed = new Date(snap.syncDate + ", " + new Date().getFullYear());
-      if (parsed > new Date()) parsed.setFullYear(parsed.getFullYear() - 1);
-      dateKey = parsed.toISOString().slice(0, 10);
-    } else {
-      dateKey = "unknown";
+    let dateKey = "unknown";
+    if (snap.syncDate) {
+      // Parse "Apr 12" — try current year first, if future try last year
+      const now = new Date();
+      const parsed = new Date(snap.syncDate + ", " + now.getFullYear());
+      if (!isNaN(parsed)) {
+        if (parsed > new Date(now.getTime() + 86400000)) { // more than 1 day in future
+          parsed.setFullYear(parsed.getFullYear() - 1);
+        }
+        dateKey = parsed.toISOString().slice(0, 10);
+      }
+    }
+    if (dateKey === "unknown" && snap._receivedAt) {
+      dateKey = snap._receivedAt.slice(0, 10);
     }
     return { ...snap, _dateKey: dateKey };
   });
