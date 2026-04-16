@@ -107,17 +107,20 @@ app.get("/history", auth, (req, res) => {
   const withDates = history.map(snap => {
     let dateKey = "unknown";
     if (snap.syncDate) {
-      // Try parsing as-is first (handles "Apr 12 2025" with year)
-      let parsed = new Date(snap.syncDate);
-      if (isNaN(parsed)) {
-        // Fallback: "Apr 12" without year — assume current year
-        const now = new Date();
+      // Check if syncDate contains a 4-digit year (e.g., "Apr 12 2025")
+      const hasYear = /\b\d{4}\b/.test(snap.syncDate);
+      const now = new Date();
+      let parsed;
+      if (hasYear) {
+        parsed = new Date(snap.syncDate);
+      } else {
+        // "Apr 12" without year — assume current year, roll back if future
         parsed = new Date(snap.syncDate + ", " + now.getFullYear());
-        if (!isNaN(parsed) && parsed > new Date(now.getTime() + 86400000)) {
+        if (!isNaN(parsed.getTime()) && parsed > new Date(now.getTime() + 86400000)) {
           parsed.setFullYear(parsed.getFullYear() - 1);
         }
       }
-      if (!isNaN(parsed)) {
+      if (!isNaN(parsed.getTime())) {
         dateKey = parsed.toISOString().slice(0, 10);
       }
     }
