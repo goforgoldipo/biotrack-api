@@ -103,6 +103,23 @@ function createApp() {
     });
   });
 
+  // GET /meta — returns stored import metadata
+  app.get("/meta", auth, (req, res) => {
+    const state = load();
+    res.json(state.meta || {});
+  });
+
+  // POST /meta — merges updates into state.meta, saves, returns { ok: true, meta }
+  app.post("/meta", auth, (req, res) => {
+    const updates = req.body;
+    if (!updates || typeof updates !== "object" || Array.isArray(updates))
+      return res.status(400).json({ error: "Body must be a JSON object" });
+    const state = load();
+    state.meta = { ...(state.meta || {}), ...updates };
+    save(state);
+    res.json({ ok: true, meta: state.meta });
+  });
+
   app.get("/", (_req, res) => res.json({ name: "BioTrack API", version: "2.0.0" }));
   app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
@@ -328,5 +345,140 @@ describe("Full E2E flow: 4-sync day simulation", () => {
   test("steps goal met (≥10000)", async () => {
     const r = await get("/latest");
     expect(r.body.steps).toBeGreaterThanOrEqual(10000);
+  });
+});
+
+// ─── /meta endpoint tests ─────────────────────────────────────────────────────
+
+describe("GET /meta", () => {
+  test("returns 401 without auth", async () => {
+    const r = await request(app).get("/meta");
+    expect(r.status).toBe(401);
+  });
+
+  test("returns empty object when no meta set (fresh state)", async () => {
+    // Clean state: write a fresh data file without meta field
+    const freshData = { history: [], latest: null };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(freshData));
+    const r = await get("/meta");
+    expect(r.status).toBe(200);
+    expect(typeof r.body).toBe("object");
+  });
+
+  test("returns stored meta after POST /meta", async () => {
+    await request(app).post("/meta").set(auth).send({ fitbod_last_import:"2026-05-01T08:00:00Z" });
+    const r = await get("/meta");
+    expect(r.status).toBe(200);
+    expect(r.body.fitbod_last_import).toBe("2026-05-01T08:00:00Z");
+  });
+});
+
+describe("POST /meta", () => {
+  test("returns 401 without auth", async () => {
+    const r = await request(app).post("/meta").send({ foo:"bar" });
+    expect(r.status).toBe(401);
+  });
+
+  test("returns 400 for array body", async () => {
+    const r = await request(app).post("/meta").set(auth).send([1, 2, 3]);
+    expect(r.status).toBe(400);
+  });
+
+  test("returns 400 for non-object body (string)", async () => {
+    const r = await request(app).post("/meta")
+      .set(auth).set("Content-Type","application/json").send('"just a string"');
+    expect(r.status).toBe(400);
+  });
+
+  test("stores key/value pairs", async () => {
+    await request(app).post("/meta").set(auth).send({ my_key:"my_value" });
+    const r = await get("/meta");
+    expect(r.body.my_key).toBe("my_value");
+  });
+
+  test("returns { ok: true, meta: {...} }", async () => {
+    const r = await request(app).post("/meta").set(auth).send({ check_key:"check_val" });
+    expect(r.status).toBe(200);
+    expect(r.body.ok).toBe(true);
+    expect(r.body.meta).toBeTruthy();
+    expect(typeof r.body.meta).toBe("object");
+  });
+
+  test("merges with existing meta (does not overwrite all)", async () => {
+    // Set two separate keys
+    await request(app).post("/meta").set(auth).send({ key_a:"value_a" });
+    await request(app).post("/meta").set(auth).send({ key_b:"value_b" });
+    const r = await get("/meta");
+    expect(r.body.key_a).toBe("value_a");
+    expect(r.body.key_b).toBe("value_b");
+  });
+
+  test("stores fitbod import timestamp", async () => {
+    const ts = "2026-05-01T10:30:00.000Z";
+    await request(app).post("/meta").set(auth).send({ fitbod_last_import: ts });
+    const r = await get("/meta");
+    expect(r.body.fitbod_last_import).toBe(ts);
+  });
+
+  test("stores trainerize import timestamp", async () => {
+    const ts = "2026-05-01T11:00:00.000Z";
+    await request(app).post("/meta").set(auth).send({ trainerize_last_import: ts });
+    const r = await get("/meta");
+    expect(r.body.trainerize_last_import).toBe(ts);
+  });
+
+  test("timestamp is preserved exactly as sent", async () => {
+    const ts = "2026-04-30T23:59:59.999Z";
+    await request(app).post("/meta").set(auth).send({ fitbod_last_import: ts });
+    const r = await get("/meta");
+    expect(r.body.fitbod_last_import).toBe(ts);
+  });
+});
+
+describe("Import metadata — fitbod workflow", () => {
+  test("POST /meta with fitbod_last_import sets the timestamp", async () => {
+    const ts = "2026-05-01T08:00:00Z";
+    const r = await request(app).post("/meta").set(auth).send({ fitbod_last_import: ts });
+    expect(r.body.ok).toBe(true);
+    expect(r.body.meta.fitbod_last_import).toBe(ts);
+  });
+
+  test("POST /meta with fitbod_days_imported sets the count", async () => {
+    await request(app).post("/meta").set(auth).send({ fitbod_days_imported: 30 });
+    const r = await get("/meta");
+    expect(r.body.fitbod_days_imported).toBe(30);
+  });
+
+  test("GET /meta returns all fitbod fields together", async () => {
+    const ts = "2026-05-02T07:00:00Z";
+    await request(app).post("/meta").set(auth).send({
+      fitbod_last_import:   ts,
+      fitbod_days_imported: 30,
+      fitbod_newest_date:   "2026-05-01",
+      fitbod_date_range:    "2026-04-01 to 2026-05-01",
+    });
+    const r = await get("/meta");
+    expect(r.body.fitbod_last_import).toBe(ts);
+    expect(r.body.fitbod_days_imported).toBe(30);
+    expect(r.body.fitbod_newest_date).toBe("2026-05-01");
+    expect(r.body.fitbod_date_range).toBe("2026-04-01 to 2026-05-01");
+  });
+
+  test("POST /meta again with new timestamp updates it", async () => {
+    const ts1 = "2026-05-01T08:00:00Z";
+    const ts2 = "2026-05-02T09:00:00Z";
+    await request(app).post("/meta").set(auth).send({ fitbod_last_import: ts1 });
+    await request(app).post("/meta").set(auth).send({ fitbod_last_import: ts2 });
+    const r = await get("/meta");
+    expect(r.body.fitbod_last_import).toBe(ts2);
+  });
+
+  test("Other meta keys not affected by fitbod update", async () => {
+    await request(app).post("/meta").set(auth).send({ trainerize_last_import:"2026-04-01T00:00:00Z" });
+    await request(app).post("/meta").set(auth).send({ fitbod_last_import:"2026-05-01T08:00:00Z" });
+    const r = await get("/meta");
+    // trainerize key should still be present
+    expect(r.body.trainerize_last_import).toBeTruthy();
+    expect(r.body.fitbod_last_import).toBeTruthy();
   });
 });

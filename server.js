@@ -206,9 +206,30 @@ app.get("/", (_req, res) => {
       "GET  /latest":  "Dashboard → get latest snapshot [auth]",
       "GET  /history": "Dashboard → get last N days [auth] ?days=30",
       "GET  /stats":   "Dashboard → aggregated averages [auth]",
+      "GET  /meta":    "Dashboard → get import metadata [auth]",
+      "POST /meta":    "Import scripts → store metadata (timestamps, counts) [auth]",
       "GET  /health":  "Uptime check [public]",
     },
   });
+});
+
+// GET /meta — fetch import metadata (e.g. last Fitbod import timestamp)
+app.get("/meta", auth, (req, res) => {
+  const state = load();
+  res.json(state.meta || {});
+});
+
+// POST /meta — store import metadata key/value pairs
+app.post("/meta", auth, (req, res) => {
+  const updates = req.body;
+  if (!updates || typeof updates !== "object" || Array.isArray(updates)) {
+    return res.status(400).json({ error: "Body must be a JSON object" });
+  }
+  const state = load();
+  state.meta = { ...(state.meta || {}), ...updates };
+  save(state);
+  console.log(`[meta] updated:`, Object.keys(updates).join(", "));
+  res.json({ ok: true, meta: state.meta });
 });
 
 // ── 404 catch-all
