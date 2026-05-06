@@ -1,99 +1,150 @@
 // ─────────────────────────────────────────────────────────────────
-//  BIOTRACK API  v2.1
+//  BIOTRACK API  v2.2
 //  Receives health snapshots from iOS app → serves to dashboard
 //
-//  ENV VARS (set in Railway dashboard → Variables):
-//    SECRET_KEY              = <your secret>
-//    PORT                    = 3000  (Railway sets automatically)
-//    ALLOWED_ORIGIN          = https://biotrack-dashboard.vercel.app
-//    UPSTASH_REDIS_REST_URL  = https://xxxxx.upstash.io   ← persistent storage
-//    UPSTASH_REDIS_REST_TOKEN= AXxxxxxxx                  ← persistent storage
-//
-//  Storage priority:
-//    1. Upstash Redis (persistent across Railway restarts) — use when env vars set
-//    2. Local data.json (falls back when Redis not configured — data lost on restart)
+//  ENV VARS (Railway Variables tab):
+//    SECRET_KEY     = <your secret>
+//    DATABASE_URL   = (auto-set by Railway when you add PostgreSQL service)
+//    PORT           = (auto-set by Railway)
+//    ALLOWED_ORIGIN = https://biotrack-dashboard.vercel.app
 // ─────────────────────────────────────────────────────────────────
 
 const express = require("express");
 const cors    = require("cors");
-const fs      = require("fs");
-const path    = require("path");
 const crypto  = require("crypto");
+const { Pool } = require("pg");
 
 const app    = express();
-const PORT   = process.env.PORT   || 3000;
+const PORT   = process.env.PORT || 3000;
 const SECRET = process.env.SECRET_KEY || (() => { throw new Error("SECRET_KEY env var required"); })();
-const DATA_FILE = path.join(__dirname, "data.json");
 
-// ── Upstash Redis (optional — persistent storage)
-const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
-const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const USE_REDIS   = !!(REDIS_URL && REDIS_TOKEN);
-const REDIS_KEY   = "biotrack:state";
+// ── PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
 
-// ── In-memory state (loaded once at startup)
-let STATE = { history: [], latest: null, meta: {} };
+// ── Create tables on startup (idempotent)
+async function dbInit() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS snapshots (
+      id          BIGSERIAL PRIMARY KEY,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      sync_date   TEXT,
+      data        JSONB NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_snap_received ON snapshots (received_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_snap_sync_date ON snapshots (sync_date);
 
-async function redisCmd(...args) {
-  const r = await fetch(`${REDIS_URL}/pipeline`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
-    body: JSON.stringify([args]),
+    CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+  console.log("  ✓ DB tables ready");
+}
+
+// ─────────────────────────────────────────────────────────────────
+// STORAGE HELPERS
+// ─────────────────────────────────────────────────────────────────
+
+async function dbInsertSnapshot(snap) {
+  await pool.query(
+    `INSERT INTO snapshots (received_at, sync_date, data) VALUES ($1, $2, $3)`,
+    [snap._receivedAt, snap.syncDate || null, JSON.stringify(snap)]
+  );
+}
+
+async function dbGetLatest() {
+  const { rows } = await pool.query(
+    `SELECT data FROM snapshots ORDER BY received_at DESC LIMIT 1`
+  );
+  return rows[0]?.data || null;
+}
+
+// Returns raw snapshot rows newest-first, enough to cover `days` unique dates
+async function dbGetHistory(days) {
+  // Fetch up to days*15 raw rows — plenty of buffer to dedup into `days` unique dates
+  const limit = Math.min(days * 15, 50000);
+  const { rows } = await pool.query(
+    `SELECT data FROM snapshots ORDER BY received_at DESC LIMIT $1`,
+    [limit]
+  );
+  return rows.map(r => r.data);
+}
+
+async function dbGetMeta() {
+  const { rows } = await pool.query(`SELECT key, value FROM meta`);
+  const out = {};
+  rows.forEach(r => {
+    try { out[r.key] = JSON.parse(r.value); } catch { out[r.key] = r.value; }
   });
-  if (!r.ok) throw new Error(`Redis HTTP ${r.status}`);
-  const [{ result, error }] = await r.json();
-  if (error) throw new Error(`Redis error: ${error}`);
-  return result;
+  return out;
 }
 
-async function initStorage() {
-  if (USE_REDIS) {
-    try {
-      const result = await redisCmd("GET", REDIS_KEY);
-      if (result) {
-        STATE = JSON.parse(result);
-        console.log(`  ✓ Redis: loaded ${STATE.history?.length || 0} snapshots`);
-        return;
+async function dbSetMeta(updates) {
+  for (const [key, value] of Object.entries(updates)) {
+    await pool.query(
+      `INSERT INTO meta (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, JSON.stringify(value)]
+    );
+  }
+}
+
+// Dedup history by date (same logic as before — merge fields across same-day syncs)
+function dedupHistory(rawSnaps, days) {
+  const withDates = rawSnaps.map(snap => {
+    let dateKey = "unknown";
+    if (snap.syncDate) {
+      const hasYear = /\b\d{4}\b/.test(snap.syncDate);
+      const now = new Date();
+      let parsed;
+      if (hasYear) {
+        const normed = snap.syncDate.replace(/^([A-Za-z]+\s+\d{1,2})\s+(\d{4})/, "$1, $2");
+        parsed = new Date(normed);
+      } else {
+        parsed = new Date(snap.syncDate + ", " + now.getFullYear());
+        if (!isNaN(parsed.getTime()) && parsed > new Date(now.getTime() + 86400000)) {
+          parsed.setFullYear(parsed.getFullYear() - 1);
+        }
       }
-      console.log("  Redis: no data yet — starting fresh");
-      return;
-    } catch (e) {
-      console.error(`  ⚠ Redis init error: ${e.message} — falling back to file`);
+      if (!isNaN(parsed.getTime())) dateKey = parsed.toISOString().slice(0, 10);
+    }
+    if (dateKey === "unknown" && snap._receivedAt) {
+      dateKey = snap._receivedAt.slice(0, 10);
+    }
+    return { ...snap, _dateKey: dateKey };
+  });
+
+  const byDate = {};
+  for (const snap of withDates) {
+    const key = snap._dateKey;
+    if (!byDate[key]) {
+      byDate[key] = { ...snap };
+    } else {
+      for (const [k, v] of Object.entries(snap)) {
+        if (k.startsWith("_")) continue;
+        if (v !== null && v !== undefined && v !== "" && v !== 0) {
+          const existing = byDate[key][k];
+          if (existing === null || existing === undefined || existing === "" || existing === 0) {
+            byDate[key][k] = v;
+          }
+        }
+      }
     }
   }
-  // File fallback
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      STATE = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-      console.log(`  File: loaded ${STATE.history?.length || 0} snapshots`);
-    }
-  } catch (e) { console.error("File load error:", e.message); }
+
+  return Object.values(byDate)
+    .sort((a, b) => (b._dateKey || "").localeCompare(a._dateKey || ""))
+    .slice(0, days)
+    .map(({ _dateKey, ...rest }) => rest);
 }
 
-// Synchronous load — returns in-memory state
-function load() {
-  return STATE;
-}
-
-// Save to memory + background-flush to Redis or file
-function save(state) {
-  STATE = state;
-  if (USE_REDIS) {
-    // Fire-and-forget Redis write (don't block the HTTP response)
-    const payload = JSON.stringify(state);
-    redisCmd("SET", REDIS_KEY, payload)
-      .catch(e => console.error("Redis save error:", e.message));
-  } else {
-    // File fallback (sync, local dev only)
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(state)); }
-    catch (e) { console.error("File save error:", e.message); }
-  }
-}
-
-// ── CORS — allow dashboard origin + localhost for dev
+// ── CORS
 const ALLOWED = [
-  process.env.ALLOWED_ORIGIN,          // e.g. https://biotrack-dashboard.vercel.app
-  "http://localhost:5173",             // Vite dev server
+  process.env.ALLOWED_ORIGIN,
+  "http://localhost:5173",
   "http://localhost:3000",
 ].filter(Boolean);
 
@@ -121,139 +172,126 @@ function auth(req, res, next) {
 // ROUTES
 // ─────────────────────────────────────────────────────────────────
 
-// POST /sync — iOS app posts here after reading HealthKit
-app.post("/sync", auth, (req, res) => {
-  const snap = req.body;
-  if (!snap || typeof snap !== "object" || Array.isArray(snap)) {
-    return res.status(400).json({ error: "Body must be a JSON object" });
+// POST /sync
+app.post("/sync", auth, async (req, res) => {
+  try {
+    const snap = req.body;
+    if (!snap || typeof snap !== "object" || Array.isArray(snap)) {
+      return res.status(400).json({ error: "Body must be a JSON object" });
+    }
+    snap._receivedAt = new Date().toISOString();
+    snap._id         = crypto.randomUUID();
+
+    await dbInsertSnapshot(snap);
+
+    const count = Object.keys(snap).filter(k => !k.startsWith("_")).length;
+    console.log(`[${snap._receivedAt}] ✓ Synced ${snap.syncDate || "?"} ${snap.syncTime || ""} — ${count} fields`);
+    res.json({ ok: true, id: snap._id, receivedAt: snap._receivedAt, fieldCount: count });
+  } catch (e) {
+    console.error("/sync error:", e.message);
+    res.status(500).json({ error: e.message });
   }
-
-  snap._receivedAt  = new Date().toISOString();
-  snap._id          = crypto.randomUUID();
-
-  const state = load();
-  state.latest = snap;
-
-  state.history.unshift(snap);
-  if (state.history.length > 20000) state.history = state.history.slice(0, 20000);
-
-  save(state);
-
-  const count = Object.keys(snap).filter(k => !k.startsWith("_")).length;
-  console.log(`[${snap._receivedAt}] ✓ Synced ${snap.syncDate || "?"} ${snap.syncTime || ""} — ${count} fields`);
-
-  res.json({ ok: true, id: snap._id, receivedAt: snap._receivedAt, fieldCount: count });
 });
 
-// GET /latest — dashboard polls this every 2 min
-app.get("/latest", auth, (req, res) => {
-  const { latest } = load();
-  if (!latest) return res.status(404).json({ error: "No data yet — open BioTrack Health on iPhone and tap Sync Now" });
-  res.json(latest);
-});
-
-// GET /history?days=30 — last N days of snapshots
-app.get("/history", auth, (req, res) => {
-  const days = Math.min(parseInt(req.query.days) || 30, 20000);
-  const { history } = load();
-
-  const withDates = history.map(snap => {
-    let dateKey = "unknown";
-    if (snap.syncDate) {
-      const hasYear = /\b\d{4}\b/.test(snap.syncDate);
-      const now = new Date();
-      let parsed;
-      if (hasYear) {
-        // "Apr 12 2026" → add comma for reliable parsing
-        const normed = snap.syncDate.replace(/^([A-Za-z]+\s+\d{1,2})\s+(\d{4})/, "$1, $2");
-        parsed = new Date(normed);
-      } else {
-        parsed = new Date(snap.syncDate + ", " + now.getFullYear());
-        if (!isNaN(parsed.getTime()) && parsed > new Date(now.getTime() + 86400000)) {
-          parsed.setFullYear(parsed.getFullYear() - 1);
-        }
-      }
-      if (!isNaN(parsed.getTime())) {
-        dateKey = parsed.toISOString().slice(0, 10);
-      }
-    }
-    if (dateKey === "unknown" && snap._receivedAt) {
-      dateKey = snap._receivedAt.slice(0, 10);
-    }
-    return { ...snap, _dateKey: dateKey };
-  });
-
-  // Merge all snapshots for the same day
-  const byDate = {};
-  for (const snap of withDates) {
-    const key = snap._dateKey;
-    if (!byDate[key]) {
-      byDate[key] = { ...snap };
-    } else {
-      for (const [k, v] of Object.entries(snap)) {
-        if (k.startsWith("_")) continue;
-        if (v !== null && v !== undefined && v !== "" && v !== 0) {
-          const existing = byDate[key][k];
-          if (existing === null || existing === undefined || existing === "" || existing === 0) {
-            byDate[key][k] = v;
-          }
-        }
-      }
-    }
+// GET /latest
+app.get("/latest", auth, async (req, res) => {
+  try {
+    const latest = await dbGetLatest();
+    if (!latest) return res.status(404).json({ error: "No data yet — open BioTrack Health on iPhone and tap Sync Now" });
+    res.json(latest);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  const sorted = Object.values(byDate)
-    .sort((a, b) => (b._dateKey || "").localeCompare(a._dateKey || ""))
-    .slice(0, days)
-    .map(({ _dateKey, ...rest }) => rest);
-
-  res.json({ count: sorted.length, days, snapshots: sorted });
 });
 
-// GET /stats — aggregate summary
-app.get("/stats", auth, (req, res) => {
-  const { history, latest } = load();
-  if (!latest) return res.status(404).json({ error: "No data yet" });
-
-  const nums = (key) => history.map(s => s[key]).filter(v => typeof v === "number");
-  const avg  = (arr) => arr.length ? +(arr.reduce((a,b) => a+b, 0) / arr.length).toFixed(1) : null;
-
-  res.json({
-    latest,
-    averages: {
-      bodyFat:   avg(nums("bodyFat")),
-      weight:    avg(nums("weight")),
-      steps:     avg(nums("steps")),
-      protein:   avg(nums("protein")),
-      calories:  avg(nums("calories")),
-      hrv:       avg(nums("hrv")),
-      sleepDur:  avg(nums("sleepDuration")),
-    },
-    totalSnapshots: history.length,
-    firstSync: history[history.length - 1]?._receivedAt || null,
-    lastSync:  latest._receivedAt,
-  });
+// GET /history?days=30
+app.get("/history", auth, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days) || 30, 20000);
+    const raw  = await dbGetHistory(days);
+    const snapshots = dedupHistory(raw, days);
+    res.json({ count: snapshots.length, days, snapshots });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// GET /health — Railway uptime checks (no auth)
-app.get("/health", (_req, res) => {
-  const { latest, history } = load();
-  res.json({
-    status: "ok",
-    storage: USE_REDIS ? "redis" : "file",
-    lastSync: latest?._receivedAt || null,
-    totalSnapshots: history.length,
-    uptime: Math.round(process.uptime()),
-    version: "2.1.0",
-  });
+// GET /stats
+app.get("/stats", auth, async (req, res) => {
+  try {
+    const latest = await dbGetLatest();
+    if (!latest) return res.status(404).json({ error: "No data yet" });
+
+    const raw  = await dbGetHistory(365);
+    const nums = (key) => raw.map(s => s[key]).filter(v => typeof v === "number");
+    const avg  = (arr) => arr.length ? +(arr.reduce((a,b) => a+b,0) / arr.length).toFixed(1) : null;
+
+    res.json({
+      latest,
+      averages: {
+        bodyFat:  avg(nums("bodyFat")),
+        weight:   avg(nums("weight")),
+        steps:    avg(nums("steps")),
+        protein:  avg(nums("protein")),
+        calories: avg(nums("calories")),
+        hrv:      avg(nums("hrv")),
+        sleepDur: avg(nums("sleepDuration")),
+      },
+      totalSnapshots: raw.length,
+      lastSync: latest._receivedAt,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// GET / — API info
+// GET /meta
+app.get("/meta", auth, async (req, res) => {
+  try {
+    res.json(await dbGetMeta());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /meta
+app.post("/meta", auth, async (req, res) => {
+  try {
+    const updates = req.body;
+    if (!updates || typeof updates !== "object" || Array.isArray(updates)) {
+      return res.status(400).json({ error: "Body must be a JSON object" });
+    }
+    await dbSetMeta(updates);
+    const meta = await dbGetMeta();
+    console.log(`[meta] updated:`, Object.keys(updates).join(", "));
+    res.json({ ok: true, meta });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /health (no auth)
+app.get("/health", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT COUNT(*) as total FROM snapshots`);
+    res.json({
+      status: "ok",
+      storage: "postgresql",
+      totalSnapshots: parseInt(rows[0].total),
+      uptime: Math.round(process.uptime()),
+      version: "2.2.0",
+    });
+  } catch (e) {
+    res.status(500).json({ status: "error", error: e.message });
+  }
+});
+
+// GET /
 app.get("/", (_req, res) => {
   res.json({
     name: "BioTrack API",
-    version: "2.1.0",
-    storage: USE_REDIS ? "upstash-redis" : "file (ephemeral — set UPSTASH env vars for persistence)",
+    version: "2.2.0",
+    storage: "postgresql",
     routes: {
       "POST /sync":    "iOS app → post HealthKit snapshot [auth]",
       "GET  /latest":  "Dashboard → get latest snapshot [auth]",
@@ -266,46 +304,25 @@ app.get("/", (_req, res) => {
   });
 });
 
-// GET /meta
-app.get("/meta", auth, (req, res) => {
-  const state = load();
-  res.json(state.meta || {});
-});
-
-// POST /meta
-app.post("/meta", auth, (req, res) => {
-  const updates = req.body;
-  if (!updates || typeof updates !== "object" || Array.isArray(updates)) {
-    return res.status(400).json({ error: "Body must be a JSON object" });
-  }
-  const state = load();
-  state.meta = { ...(state.meta || {}), ...updates };
-  save(state);
-  console.log(`[meta] updated:`, Object.keys(updates).join(", "));
-  res.json({ ok: true, meta: state.meta });
-});
-
-// ── 404
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
-
-// ── Error handler
 app.use((err, _req, res, _next) => {
   console.error(err.message);
   res.status(500).json({ error: err.message });
 });
 
-// ── Start: load storage first, then listen
-initStorage().then(() => {
-  app.listen(PORT, () => {
-    console.log(`\n⬡ BioTrack API v2.1 — port ${PORT}`);
-    console.log(`  Storage: ${USE_REDIS ? `Upstash Redis (${REDIS_URL?.slice(0,40)}...)` : "local file (ephemeral)"}`);
-    console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
-    console.log(`  CORS origins: ${ALLOWED.join(", ") || "all"}`);
-    console.log(`  Snapshots in memory: ${STATE.history?.length || 0}\n`);
+// ── Start
+dbInit()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`\n⬡ BioTrack API v2.2 — port ${PORT}`);
+      console.log(`  Storage: PostgreSQL`);
+      console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
+      console.log(`  CORS: ${ALLOWED.join(", ") || "all"}\n`);
+    });
+  })
+  .catch(e => {
+    console.error("Fatal startup error:", e.message);
+    process.exit(1);
   });
-}).catch(e => {
-  console.error("Fatal startup error:", e.message);
-  process.exit(1);
-});
 
 module.exports = app;
