@@ -117,6 +117,15 @@ function dedupHistory(rawSnaps, days) {
     return { ...snap, _dateKey: dateKey };
   });
 
+  // Sort: iOS app syncs (no _source) before imports, then newest-received first.
+  // This ensures real device data always wins over imported historical data.
+  withDates.sort((a, b) => {
+    const aIsImport = a._source ? 1 : 0;
+    const bIsImport = b._source ? 1 : 0;
+    if (aIsImport !== bIsImport) return aIsImport - bIsImport; // iOS first
+    return (b._receivedAt || "").localeCompare(a._receivedAt || ""); // then newest
+  });
+
   const byDate = {};
   for (const snap of withDates) {
     const key = snap._dateKey;
