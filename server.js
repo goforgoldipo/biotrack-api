@@ -327,9 +327,8 @@ app.get("/", (_req, res) => {
 const cron = require("node-cron");
 const { Resend } = require("resend");
 
-async function callClaude(prompt, systemPrompt) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error("ANTHROPIC_API_KEY not set in Railway env vars");
+async function callClaude(prompt, systemPrompt, key) {
+  if (!key) throw new Error("Anthropic API key not configured");
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -349,8 +348,7 @@ async function callClaude(prompt, systemPrompt) {
   return j.content[0].text;
 }
 
-async function sendPushNotification(title, body) {
-  const topic = process.env.NTFY_TOPIC;
+async function sendPushNotification(title, body, topic) {
   if (!topic) return;
   await fetch(`https://ntfy.sh/${topic}`, {
     method: "POST",
@@ -364,11 +362,9 @@ async function sendPushNotification(title, body) {
   }).catch(e => console.warn("Push notification failed:", e.message));
 }
 
-async function sendCoachingEmail(subject, htmlContent, textContent) {
-  const apiKey = process.env.RESEND_API_KEY;
-  const toEmail = process.env.COACHING_EMAIL;
+async function sendCoachingEmail(subject, htmlContent, textContent, toEmail, apiKey) {
   if (!apiKey || !toEmail) {
-    console.log("  ℹ Email not configured (set RESEND_API_KEY + COACHING_EMAIL)");
+    console.log("  ℹ Email not configured");
     return;
   }
   const resend = new Resend(apiKey);
@@ -449,11 +445,62 @@ function buildEmailHtml(coachingText, today) {
 </body></html>`;
 }
 
+async function getCoachingSettings() {
+  // DB settings override env vars — set via dashboard UI
+  const meta = await dbGetMeta();
+  return {
+    anthropicKey: meta.coaching_anthropic_key || process.env.ANTHROPIC_API_KEY || null,
+    email:        meta.coaching_email         || process.env.COACHING_EMAIL     || null,
+    resendKey:    meta.coaching_resend_key    || process.env.RESEND_API_KEY     || null,
+    ntfyTopic:    meta.coaching_ntfy_topic    || process.env.NTFY_TOPIC         || null,
+    enabled:      meta.coaching_enabled !== "false",
+    cronTime:     meta.coaching_cron_time     || process.env.COACHING_CRON      || "0 11 * * *",
+  };
+}
+
+// POST /coaching/settings — save from dashboard UI (auth required)
+app.post("/coaching/settings", auth, async (req, res) => {
+  try {
+    const { anthropicKey, email, resendKey, ntfyTopic, enabled, cronTime } = req.body;
+    const updates = {};
+    if (anthropicKey  !== undefined) updates.coaching_anthropic_key = anthropicKey;
+    if (email         !== undefined) updates.coaching_email         = email;
+    if (resendKey     !== undefined) updates.coaching_resend_key    = resendKey;
+    if (ntfyTopic     !== undefined) updates.coaching_ntfy_topic    = ntfyTopic;
+    if (enabled       !== undefined) updates.coaching_enabled       = String(enabled);
+    if (cronTime      !== undefined) updates.coaching_cron_time     = cronTime;
+    await dbSetMeta(updates);
+    console.log("[coaching/settings] Updated:", Object.keys(updates).join(", "));
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /coaching/settings — load for dashboard UI (auth required, keys masked)
+app.get("/coaching/settings", auth, async (req, res) => {
+  try {
+    const s = await getCoachingSettings();
+    res.json({
+      anthropicKeySet: !!s.anthropicKey,
+      anthropicKeyHint: s.anthropicKey ? s.anthropicKey.slice(0,12)+"..." : null,
+      email:     s.email     || null,
+      resendKeySet: !!s.resendKey,
+      ntfyTopic: s.ntfyTopic || null,
+      enabled:   s.enabled,
+      cronTime:  s.cronTime,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 async function runDailyCoaching() {
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-  const TO_EMAIL      = process.env.COACHING_EMAIL;
+  const cfg = await getCoachingSettings();
+  const ANTHROPIC_KEY = cfg.anthropicKey;
+  const TO_EMAIL      = cfg.email;
   if (!ANTHROPIC_KEY) {
-    console.log("[coaching] Skipping — ANTHROPIC_API_KEY not set");
+    console.log("[coaching] Skipping — Anthropic API key not configured");
+    return;
+  }
+  if (!cfg.enabled) {
+    console.log("[coaching] Skipping — coaching disabled");
     return;
   }
 
@@ -477,23 +524,28 @@ Based on this data, give Brandon today's coaching brief covering:
 
 Be brutally honest and specific. No fluff.`;
 
-    const coaching = await callClaude(userPrompt, systemPrompt);
+    const coaching = await callClaude(userPrompt, systemPrompt, ANTHROPIC_KEY);
     console.log("[coaching] Claude response received");
 
     // Send push notification (short version)
     const lines = coaching.split("\n").filter(l => l.trim()).slice(0,3).join(" ").slice(0,200);
-    await sendPushNotification(
-      `🏋️ BioTrack Daily Brief — ${today.syncDate || "Today"}`,
-      lines
-    );
+    if (cfg.ntfyTopic) {
+      await sendPushNotification(
+        `🏋️ BioTrack Daily Brief — ${today.syncDate || "Today"}`,
+        lines,
+        cfg.ntfyTopic
+      );
+    }
 
     // Send email (full version)
-    if (TO_EMAIL) {
+    if (TO_EMAIL && cfg.resendKey) {
       const html = buildEmailHtml(coaching, today);
       await sendCoachingEmail(
         `⬡ BioTrack Daily Coach — ${today.syncDate || new Date().toLocaleDateString()}`,
         html,
-        coaching
+        coaching,
+        TO_EMAIL,
+        cfg.resendKey
       );
       console.log(`[coaching] Email sent to ${TO_EMAIL}`);
     }
@@ -546,18 +598,13 @@ dbInit()
       console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
       console.log(`  CORS: ${ALLOWED.join(", ") || "all"}`);
 
-      // ── Daily coaching cron — 7:00 AM UTC every day
-      // (7am UTC = 3am ET / 12am PT — adjust COACHING_CRON env var to change)
+      // ── Daily coaching cron — checks DB settings each fire so changes take effect immediately
       const cronSchedule = process.env.COACHING_CRON || "0 11 * * *"; // default 11am UTC = 7am ET
-      if (process.env.ANTHROPIC_API_KEY) {
-        cron.schedule(cronSchedule, () => {
-          console.log(`[cron] Firing daily coaching brief...`);
-          runDailyCoaching();
-        }, { timezone: "UTC" });
-        console.log(`  🧠 Daily coaching cron: ${cronSchedule} UTC`);
-      } else {
-        console.log(`  ⚠ Daily coaching disabled — set ANTHROPIC_API_KEY in Railway vars`);
-      }
+      cron.schedule(cronSchedule, () => {
+        console.log(`[cron] Firing daily coaching brief...`);
+        runDailyCoaching();
+      }, { timezone: "UTC" });
+      console.log(`  🧠 Daily coaching cron: ${cronSchedule} UTC (configure in dashboard → Sync → Coaching)`);
       console.log();
     });
   })
