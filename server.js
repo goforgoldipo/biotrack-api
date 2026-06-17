@@ -314,17 +314,19 @@ app.get("/", (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-// DAILY COACHING ENGINE
-// Calls Claude with 30-day biometric data → emails + push notification
+// COACHING ENGINE — morning brief (5am ET) + evening recap (5pm ET)
 //
-// ENV VARS needed in Railway Variables tab:
-//   ANTHROPIC_API_KEY  = sk-ant-...
-//   RESEND_API_KEY     = re_...  (get free at resend.com)
-//   COACHING_EMAIL     = your@email.com
-//   NTFY_TOPIC         = your-private-topic (e.g. biotrack-brandon-xyz)
+// ENV VARS (Railway Variables tab) — or set via dashboard → Coaching:
+//   ANTHROPIC_API_KEY   = sk-ant-...
+//   COACHING_EMAIL      = your@email.com
+//   NTFY_TOPIC          = biotrack
+//   GMAIL_USER          = brandonbiotrack@gmail.com
+//   GMAIL_APP_PASSWORD  = xxxx xxxx xxxx xxxx  (Gmail app password)
+//   RESEND_API_KEY      = re_...  (optional alternative to Gmail)
 // ─────────────────────────────────────────────────────────────────
 
-const cron = require("node-cron");
+const cron       = require("node-cron");
+const nodemailer = require("nodemailer");
 const { Resend } = require("resend");
 
 async function callClaude(prompt, systemPrompt, key) {
@@ -362,19 +364,42 @@ async function sendPushNotification(title, body, topic) {
   }).catch(e => console.warn("Push notification failed:", e.message));
 }
 
-async function sendCoachingEmail(subject, htmlContent, textContent, toEmail, apiKey) {
-  if (!apiKey || !toEmail) {
-    console.log("  ℹ Email not configured");
+async function sendCoachingEmail(subject, htmlContent, textContent, cfg) {
+  const { email: toEmail, resendKey, gmailUser, gmailPass } = cfg;
+  if (!toEmail) { console.log("  ℹ Email not configured (no COACHING_EMAIL)"); return; }
+
+  // Gmail SMTP preferred (free, no account setup beyond app password)
+  if (gmailUser && gmailPass) {
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user: gmailUser, pass: gmailPass },
+    });
+    await transporter.sendMail({
+      from: `"BioTrack Coach" <${gmailUser}>`,
+      to: toEmail,
+      subject,
+      html: htmlContent,
+      text: textContent,
+    });
+    console.log(`  ✉ Email sent via Gmail → ${toEmail}`);
     return;
   }
-  const resend = new Resend(apiKey);
-  await resend.emails.send({
-    from: "BioTrack Coach <coach@biotrack.health>",
-    to: toEmail,
-    subject,
-    html: htmlContent,
-    text: textContent,
-  });
+
+  // Resend fallback
+  if (resendKey) {
+    const resend = new Resend(resendKey);
+    await resend.emails.send({
+      from: "BioTrack Coach <onboarding@resend.dev>",
+      to: toEmail,
+      subject,
+      html: htmlContent,
+      text: textContent,
+    });
+    console.log(`  ✉ Email sent via Resend → ${toEmail}`);
+    return;
+  }
+
+  console.log("  ℹ Email skipped — no Gmail app password or Resend key configured");
 }
 
 function buildDataContext(snapshots) {
@@ -446,29 +471,35 @@ function buildEmailHtml(coachingText, today) {
 }
 
 async function getCoachingSettings() {
-  // DB settings override env vars — set via dashboard UI
   const meta = await dbGetMeta();
   return {
-    anthropicKey: meta.coaching_anthropic_key || process.env.ANTHROPIC_API_KEY || null,
-    email:        meta.coaching_email         || process.env.COACHING_EMAIL     || null,
-    resendKey:    meta.coaching_resend_key    || process.env.RESEND_API_KEY     || null,
-    ntfyTopic:    meta.coaching_ntfy_topic    || process.env.NTFY_TOPIC         || null,
+    anthropicKey: meta.coaching_anthropic_key  || process.env.ANTHROPIC_API_KEY  || null,
+    email:        meta.coaching_email          || process.env.COACHING_EMAIL      || null,
+    resendKey:    meta.coaching_resend_key     || process.env.RESEND_API_KEY      || null,
+    gmailUser:    meta.coaching_gmail_user     || process.env.GMAIL_USER          || null,
+    gmailPass:    meta.coaching_gmail_pass     || process.env.GMAIL_APP_PASSWORD  || null,
+    ntfyTopic:    meta.coaching_ntfy_topic     || process.env.NTFY_TOPIC          || null,
     enabled:      meta.coaching_enabled !== "false",
-    cronTime:     meta.coaching_cron_time     || process.env.COACHING_CRON      || "0 11 * * *",
+    // Two separate cron schedules (UTC) — default 5am ET = 9am UTC, 5pm ET = 9pm UTC
+    cronMorning:  meta.coaching_cron_morning   || process.env.COACHING_CRON_AM   || "0 9 * * *",
+    cronEvening:  meta.coaching_cron_evening   || process.env.COACHING_CRON_PM   || "0 21 * * *",
   };
 }
 
 // POST /coaching/settings — save from dashboard UI (auth required)
 app.post("/coaching/settings", auth, async (req, res) => {
   try {
-    const { anthropicKey, email, resendKey, ntfyTopic, enabled, cronTime } = req.body;
+    const { anthropicKey, email, resendKey, gmailUser, gmailPass, ntfyTopic, enabled, cronMorning, cronEvening } = req.body;
     const updates = {};
     if (anthropicKey  !== undefined) updates.coaching_anthropic_key = anthropicKey;
     if (email         !== undefined) updates.coaching_email         = email;
     if (resendKey     !== undefined) updates.coaching_resend_key    = resendKey;
+    if (gmailUser     !== undefined) updates.coaching_gmail_user    = gmailUser;
+    if (gmailPass     !== undefined) updates.coaching_gmail_pass    = gmailPass;
     if (ntfyTopic     !== undefined) updates.coaching_ntfy_topic    = ntfyTopic;
     if (enabled       !== undefined) updates.coaching_enabled       = String(enabled);
-    if (cronTime      !== undefined) updates.coaching_cron_time     = cronTime;
+    if (cronMorning   !== undefined) updates.coaching_cron_morning  = cronMorning;
+    if (cronEvening   !== undefined) updates.coaching_cron_evening  = cronEvening;
     await dbSetMeta(updates);
     console.log("[coaching/settings] Updated:", Object.keys(updates).join(", "));
     res.json({ ok: true });
@@ -482,29 +513,24 @@ app.get("/coaching/settings", auth, async (req, res) => {
     res.json({
       anthropicKeySet: !!s.anthropicKey,
       anthropicKeyHint: s.anthropicKey ? s.anthropicKey.slice(0,12)+"..." : null,
-      email:     s.email     || null,
+      email:        s.email      || null,
       resendKeySet: !!s.resendKey,
-      ntfyTopic: s.ntfyTopic || null,
-      enabled:   s.enabled,
-      cronTime:  s.cronTime,
+      gmailUser:    s.gmailUser  || null,
+      gmailPassSet: !!s.gmailPass,
+      ntfyTopic:    s.ntfyTopic  || null,
+      enabled:      s.enabled,
+      cronMorning:  s.cronMorning,
+      cronEvening:  s.cronEvening,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-async function runDailyCoaching() {
+async function runDailyCoaching(session = "morning") {
   const cfg = await getCoachingSettings();
-  const ANTHROPIC_KEY = cfg.anthropicKey;
-  const TO_EMAIL      = cfg.email;
-  if (!ANTHROPIC_KEY) {
-    console.log("[coaching] Skipping — Anthropic API key not configured");
-    return;
-  }
-  if (!cfg.enabled) {
-    console.log("[coaching] Skipping — coaching disabled");
-    return;
-  }
+  if (!cfg.anthropicKey) { console.log("[coaching] Skipping — Anthropic API key not configured"); return; }
+  if (!cfg.enabled)       { console.log("[coaching] Skipping — coaching disabled"); return; }
 
-  console.log(`[coaching] Running daily coaching brief...`);
+  console.log(`[coaching] Running ${session} brief...`);
   try {
     const raw = await dbGetHistory(30);
     const snapshots = dedupHistory(raw, 30);
@@ -513,71 +539,86 @@ async function runDailyCoaching() {
     const today = snapshots[0];
     const dataCtx = buildDataContext(snapshots);
     const systemPrompt = `You are an elite performance coach and body recomposition specialist. Your athlete is Brandon Bornancin — a vegan founder pushing hard to reach 10% body fat from his current level. You are direct, data-driven, and motivating. You write like a world-class coach who deeply understands the data, not a generic chatbot. Be specific with numbers from the data. Keep responses under 500 words. Use markdown headers and bold for key points.`;
-    const userPrompt = `${dataCtx}
 
-Based on this data, give Brandon today's coaching brief covering:
-1. **Recovery & Readiness** — what does the HRV/sleep/resting HR tell you about today's readiness?
-2. **Body Composition Progress** — weight/BF trend, is he on track for 10%? How many weeks away?
-3. **Today's #1 Priority** — the single most important thing to focus on today (training, nutrition, or recovery)
-4. **Nutrition Target** — exact calorie and protein targets for today based on his data
-5. **Motivation** — one sharp, data-backed sentence to drive him forward
+    const userPrompt = session === "morning"
+      ? `${dataCtx}
 
-Be brutally honest and specific. No fluff.`;
+🌅 MORNING BRIEF — give Brandon his 5am game plan:
+1. **Recovery Score** — what does HRV/sleep/resting HR say about readiness today? Green/yellow/red and why.
+2. **Body Comp Check** — weight + BF trend this week. On track for 10%? Weeks remaining at this pace?
+3. **Today's Training Focus** — should he train hard, go light, or rest? What muscle groups? Why?
+4. **Nutrition Targets** — exact calories and protein grams for today. Adjust for yesterday's intake.
+5. **Win the Morning** — one specific action to take in the next 60 minutes.
 
-    const coaching = await callClaude(userPrompt, systemPrompt, ANTHROPIC_KEY);
-    console.log("[coaching] Claude response received");
+Be sharp, specific, and energizing. No fluff. This sets the tone for the entire day.`
+      : `${dataCtx}
 
-    // Send push notification (short version)
-    const lines = coaching.split("\n").filter(l => l.trim()).slice(0,3).join(" ").slice(0,200);
+🌙 EVENING RECAP — give Brandon his 5pm performance review:
+1. **Today's Scorecard** — how did today's metrics compare to targets? What was the grade (A/B/C/D)?
+2. **What Moved the Needle** — the 1-2 things today that most impacted body comp positively or negatively.
+3. **Recovery Protocol for Tonight** — exact sleep target, anything to optimize recovery (timing, nutrition, wind-down).
+4. **Tomorrow's Game Plan** — one thing to do differently tomorrow based on today's data.
+5. **Progress Update** — current trajectory: if he keeps this pace, when does he hit 10% BF?
+
+Be honest, data-driven, and motivating. Help him end the day with clarity and intent.`;
+
+    const coaching = await callClaude(userPrompt, systemPrompt, cfg.anthropicKey);
+    console.log(`[coaching] Claude ${session} response received`);
+
+    // ntfy push (short preview)
     if (cfg.ntfyTopic) {
-      await sendPushNotification(
-        `🏋️ BioTrack Daily Brief — ${today.syncDate || "Today"}`,
-        lines,
-        cfg.ntfyTopic
-      );
+      const preview = coaching.split("\n").filter(l => l.trim()).slice(0, 3).join(" ").slice(0, 200);
+      const title = session === "morning"
+        ? `🌅 BioTrack Morning Brief — ${today.syncDate || "Today"}`
+        : `🌙 BioTrack Evening Recap — ${today.syncDate || "Today"}`;
+      await sendPushNotification(title, preview, cfg.ntfyTopic);
     }
 
-    // Send email (full version)
-    if (TO_EMAIL && cfg.resendKey) {
-      const html = buildEmailHtml(coaching, today);
-      await sendCoachingEmail(
-        `⬡ BioTrack Daily Coach — ${today.syncDate || new Date().toLocaleDateString()}`,
-        html,
-        coaching,
-        TO_EMAIL,
-        cfg.resendKey
-      );
-      console.log(`[coaching] Email sent to ${TO_EMAIL}`);
-    }
+    // Email (full formatted version)
+    const emailSubject = session === "morning"
+      ? `🌅 BioTrack Morning Brief — ${today.syncDate || new Date().toLocaleDateString()}`
+      : `🌙 BioTrack Evening Recap — ${today.syncDate || new Date().toLocaleDateString()}`;
+    const html = buildEmailHtml(coaching, today);
+    await sendCoachingEmail(emailSubject, html, coaching, cfg);
 
-    // Store in DB so dashboard can show it
+    // Store last brief in DB
     await dbSetMeta({
+      [`last_coaching_brief_${session}`]: coaching,
+      [`last_coaching_date_${session}`]:  new Date().toISOString(),
       last_coaching_brief: coaching,
-      last_coaching_date: new Date().toISOString(),
+      last_coaching_date:  new Date().toISOString(),
     });
 
-    console.log("[coaching] ✓ Daily coaching complete");
+    console.log(`[coaching] ✓ ${session} brief complete`);
   } catch(e) {
     console.error("[coaching] Error:", e.message);
   }
 }
 
-// POST /coaching/run — manually trigger (auth required)
+// POST /coaching/run — manually trigger (auth required). ?session=morning|evening
 app.post("/coaching/run", auth, async (req, res) => {
   try {
-    await runDailyCoaching();
+    const session = req.query.session || req.body.session || "morning";
+    await runDailyCoaching(session);
     const meta = await dbGetMeta();
-    res.json({ ok: true, brief: meta.last_coaching_brief, date: meta.last_coaching_date });
+    res.json({ ok: true, session, brief: meta.last_coaching_brief, date: meta.last_coaching_date });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// GET /coaching/latest — get last brief (auth required)
+// GET /coaching/latest — get last brief(s) (auth required)
 app.get("/coaching/latest", auth, async (req, res) => {
   try {
     const meta = await dbGetMeta();
-    res.json({ brief: meta.last_coaching_brief || null, date: meta.last_coaching_date || null });
+    res.json({
+      brief:          meta.last_coaching_brief          || null,
+      date:           meta.last_coaching_date           || null,
+      morningBrief:   meta.last_coaching_brief_morning  || null,
+      morningDate:    meta.last_coaching_date_morning   || null,
+      eveningBrief:   meta.last_coaching_brief_evening  || null,
+      eveningDate:    meta.last_coaching_date_evening   || null,
+    });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -598,13 +639,20 @@ dbInit()
       console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
       console.log(`  CORS: ${ALLOWED.join(", ") || "all"}`);
 
-      // ── Daily coaching cron — checks DB settings each fire so changes take effect immediately
-      const cronSchedule = process.env.COACHING_CRON || "0 11 * * *"; // default 11am UTC = 7am ET
-      cron.schedule(cronSchedule, () => {
-        console.log(`[cron] Firing daily coaching brief...`);
-        runDailyCoaching();
+      // ── Two coaching crons: 5am ET (9am UTC) + 5pm ET (9pm UTC)
+      // Settings are re-read from DB on each fire, so dashboard changes take effect immediately
+      const cronAM = process.env.COACHING_CRON_AM || "0 9 * * *";  // 5am ET
+      const cronPM = process.env.COACHING_CRON_PM || "0 21 * * *"; // 5pm ET
+      cron.schedule(cronAM, () => {
+        console.log("[cron] Firing morning brief (5am ET)...");
+        runDailyCoaching("morning");
       }, { timezone: "UTC" });
-      console.log(`  🧠 Daily coaching cron: ${cronSchedule} UTC (configure in dashboard → Sync → Coaching)`);
+      cron.schedule(cronPM, () => {
+        console.log("[cron] Firing evening recap (5pm ET)...");
+        runDailyCoaching("evening");
+      }, { timezone: "UTC" });
+      console.log(`  🌅 Morning brief cron: ${cronAM} UTC (5am ET)`);
+      console.log(`  🌙 Evening recap cron: ${cronPM} UTC (5pm ET)`);
       console.log();
     });
   })
