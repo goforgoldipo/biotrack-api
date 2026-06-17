@@ -470,6 +470,20 @@ function buildEmailHtml(coachingText, today) {
 </body></html>`;
 }
 
+// Brandon's hard goals — used in every coaching prompt so Claude always knows the targets
+const BRANDON_GOALS = `
+HARD GOALS (non-negotiable targets):
+• Body Fat: reach 10% BF (currently ~15-16%) — primary goal
+• Steps: 10,000+ steps every day
+• Protein: 180g+ per day (vegan — must hit this to preserve lean mass)
+• Calories: deficit days ~2,200 kcal, maintenance ~2,600 kcal (adjust based on training)
+• Sleep: 7.5h+ per night minimum
+• Training: 5 sessions/week, progressive overload
+• HRV: maintain above 60ms — below = recovery day
+• Water: 100+ oz/day
+• Weight loss pace: 0.5-1 lb/week (preserve muscle, lose only fat)
+`.trim();
+
 async function getCoachingSettings() {
   const meta = await dbGetMeta();
   return {
@@ -480,8 +494,9 @@ async function getCoachingSettings() {
     gmailPass:    meta.coaching_gmail_pass     || process.env.GMAIL_APP_PASSWORD  || null,
     ntfyTopic:    meta.coaching_ntfy_topic     || process.env.NTFY_TOPIC          || null,
     enabled:      meta.coaching_enabled !== "false",
-    // Two separate cron schedules (UTC) — default 5am ET = 9am UTC, 5pm ET = 9pm UTC
+    // 3 daily crons (UTC): 5am ET = 9 UTC, 12pm ET = 16 UTC, 5pm ET = 21 UTC
     cronMorning:  meta.coaching_cron_morning   || process.env.COACHING_CRON_AM   || "0 9 * * *",
+    cronMidday:   meta.coaching_cron_midday    || process.env.COACHING_CRON_MD   || "0 16 * * *",
     cronEvening:  meta.coaching_cron_evening   || process.env.COACHING_CRON_PM   || "0 21 * * *",
   };
 }
@@ -489,7 +504,7 @@ async function getCoachingSettings() {
 // POST /coaching/settings — save from dashboard UI (auth required)
 app.post("/coaching/settings", auth, async (req, res) => {
   try {
-    const { anthropicKey, email, resendKey, gmailUser, gmailPass, ntfyTopic, enabled, cronMorning, cronEvening } = req.body;
+    const { anthropicKey, email, resendKey, gmailUser, gmailPass, ntfyTopic, enabled, cronMorning, cronMidday, cronEvening } = req.body;
     const updates = {};
     if (anthropicKey  !== undefined) updates.coaching_anthropic_key = anthropicKey;
     if (email         !== undefined) updates.coaching_email         = email;
@@ -499,6 +514,7 @@ app.post("/coaching/settings", auth, async (req, res) => {
     if (ntfyTopic     !== undefined) updates.coaching_ntfy_topic    = ntfyTopic;
     if (enabled       !== undefined) updates.coaching_enabled       = String(enabled);
     if (cronMorning   !== undefined) updates.coaching_cron_morning  = cronMorning;
+    if (cronMidday    !== undefined) updates.coaching_cron_midday   = cronMidday;
     if (cronEvening   !== undefined) updates.coaching_cron_evening  = cronEvening;
     await dbSetMeta(updates);
     console.log("[coaching/settings] Updated:", Object.keys(updates).join(", "));
@@ -520,10 +536,53 @@ app.get("/coaching/settings", auth, async (req, res) => {
       ntfyTopic:    s.ntfyTopic  || null,
       enabled:      s.enabled,
       cronMorning:  s.cronMorning,
+      cronMidday:   s.cronMidday,
       cronEvening:  s.cronEvening,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+function buildSessionPrompt(session, dataCtx) {
+  const goals = BRANDON_GOALS;
+  if (session === "morning") return `${dataCtx}
+
+${goals}
+
+🌅 5AM MORNING BRIEF — set Brandon up to win the day:
+1. **Readiness Score** — HRV / sleep / resting HR → Green (train hard), Yellow (moderate), or Red (recover). Be specific with the numbers.
+2. **Goal Tracker** — for EACH goal (BF%, steps, protein, sleep, weight pace) tell him: ✅ on track or ⚠️ behind, with the exact number vs target.
+3. **Training Plan** — should he train today? Which muscle groups? Intensity level (heavy/moderate/light/rest)? What time is optimal given his HRV?
+4. **Nutrition Blueprint** — exact calorie target and protein gram target for today. What to prioritize at breakfast and lunch to hit protein early.
+5. **#1 Action Right Now** — the single most impactful thing to do in the next hour to stay on track for 10% BF.
+
+Sharp, specific, data-driven. This is his 5am launchpad.`;
+
+  if (session === "midday") return `${dataCtx}
+
+${goals}
+
+☀️ 12PM MIDDAY CHECK-IN — how is Brandon doing vs his daily goals RIGHT NOW:
+1. **Steps Pace Check** — he has ${Math.round(0)} steps so far. At this pace, will he hit 10,000 today? How many does he need in the next hour to stay on pace?
+2. **Nutrition Check** — based on yesterday's protein/calorie data, is he typically ahead or behind at midday? What should he eat RIGHT NOW for lunch to stay on target?
+3. **Energy & Recovery** — based on HRV and sleep data, how is his energy likely holding up? Any signs of overtraining or under-recovery?
+4. **Afternoon Training Window** — if he hasn't trained yet, what's the optimal workout for this afternoon? Give him a specific plan.
+5. **Body Comp Momentum** — is today on track to contribute to reaching 10% BF? What is the one thing he can do in the next 4 hours to guarantee today is a win?
+
+This is his midday course correction. Be direct — is he winning or losing today?`;
+
+  return `${dataCtx}
+
+${goals}
+
+🌙 5PM EVENING PERFORMANCE REVIEW — grade today and plan tomorrow:
+1. **Daily Scorecard** — grade each goal (A/B/C/D/F): steps vs 10k, protein vs 180g, calories vs target, sleep from last night, training completed. Overall day grade.
+2. **Body Comp Impact** — was today a fat-loss day or not? Based on the data, did today move him toward 10% BF or away from it? By how much?
+3. **What to Do TONIGHT** — exact recovery actions: sleep time target, evening meal (if any), wind-down protocol to maximize HRV tomorrow.
+4. **Tomorrow's Pre-Plan** — based on today's data, exactly what should tomorrow look like? Training Y/N, calorie target, protein target, step target.
+5. **Progress Update** — current BF% is ${0}%. Goal is 10%. At this week's pace, he hits 10% in approximately X weeks. What needs to change to get there faster?
+
+Be brutally honest. No participation trophies. If today was bad, say so and tell him exactly how to fix it tomorrow.`;
+}
 
 async function runDailyCoaching(session = "morning") {
   const cfg = await getCoachingSettings();
@@ -538,50 +597,33 @@ async function runDailyCoaching(session = "morning") {
 
     const today = snapshots[0];
     const dataCtx = buildDataContext(snapshots);
-    const systemPrompt = `You are an elite performance coach and body recomposition specialist. Your athlete is Brandon Bornancin — a vegan founder pushing hard to reach 10% body fat from his current level. You are direct, data-driven, and motivating. You write like a world-class coach who deeply understands the data, not a generic chatbot. Be specific with numbers from the data. Keep responses under 500 words. Use markdown headers and bold for key points.`;
 
-    const userPrompt = session === "morning"
-      ? `${dataCtx}
+    const systemPrompt = `You are Brandon Bornancin's personal elite performance coach specializing in body recomposition. Brandon is a vegan founder with one mission: get from ~15-16% body fat to 10% while preserving lean mass. You have 30 days of his biometric data. You are direct, specific, and data-driven — not a generic chatbot. Every response references exact numbers from his data. You speak in a tone that is intense, results-focused, and motivating. Under 500 words. Use **bold** for key numbers and action items.`;
 
-🌅 MORNING BRIEF — give Brandon his 5am game plan:
-1. **Recovery Score** — what does HRV/sleep/resting HR say about readiness today? Green/yellow/red and why.
-2. **Body Comp Check** — weight + BF trend this week. On track for 10%? Weeks remaining at this pace?
-3. **Today's Training Focus** — should he train hard, go light, or rest? What muscle groups? Why?
-4. **Nutrition Targets** — exact calories and protein grams for today. Adjust for yesterday's intake.
-5. **Win the Morning** — one specific action to take in the next 60 minutes.
-
-Be sharp, specific, and energizing. No fluff. This sets the tone for the entire day.`
-      : `${dataCtx}
-
-🌙 EVENING RECAP — give Brandon his 5pm performance review:
-1. **Today's Scorecard** — how did today's metrics compare to targets? What was the grade (A/B/C/D)?
-2. **What Moved the Needle** — the 1-2 things today that most impacted body comp positively or negatively.
-3. **Recovery Protocol for Tonight** — exact sleep target, anything to optimize recovery (timing, nutrition, wind-down).
-4. **Tomorrow's Game Plan** — one thing to do differently tomorrow based on today's data.
-5. **Progress Update** — current trajectory: if he keeps this pace, when does he hit 10% BF?
-
-Be honest, data-driven, and motivating. Help him end the day with clarity and intent.`;
-
+    const userPrompt = buildSessionPrompt(session, dataCtx);
     const coaching = await callClaude(userPrompt, systemPrompt, cfg.anthropicKey);
     console.log(`[coaching] Claude ${session} response received`);
 
-    // ntfy push (short preview)
+    // ntfy push — title + 200-char preview
     if (cfg.ntfyTopic) {
       const preview = coaching.split("\n").filter(l => l.trim()).slice(0, 3).join(" ").slice(0, 200);
-      const title = session === "morning"
-        ? `🌅 BioTrack Morning Brief — ${today.syncDate || "Today"}`
-        : `🌙 BioTrack Evening Recap — ${today.syncDate || "Today"}`;
-      await sendPushNotification(title, preview, cfg.ntfyTopic);
+      const titles = {
+        morning: `🌅 5AM Brief — ${today.syncDate || "Today"}`,
+        midday:  `☀️ 12PM Check-In — ${today.syncDate || "Today"}`,
+        evening: `🌙 5PM Recap — ${today.syncDate || "Today"}`,
+      };
+      await sendPushNotification(titles[session] || "BioTrack Coach", preview, cfg.ntfyTopic);
     }
 
-    // Email (full formatted version)
-    const emailSubject = session === "morning"
-      ? `🌅 BioTrack Morning Brief — ${today.syncDate || new Date().toLocaleDateString()}`
-      : `🌙 BioTrack Evening Recap — ${today.syncDate || new Date().toLocaleDateString()}`;
-    const html = buildEmailHtml(coaching, today);
-    await sendCoachingEmail(emailSubject, html, coaching, cfg);
+    // Email — full formatted version
+    const subjects = {
+      morning: `🌅 BioTrack 5AM Brief — ${today.syncDate || new Date().toLocaleDateString()}`,
+      midday:  `☀️ BioTrack 12PM Check-In — ${today.syncDate || new Date().toLocaleDateString()}`,
+      evening: `🌙 BioTrack 5PM Recap — ${today.syncDate || new Date().toLocaleDateString()}`,
+    };
+    await sendCoachingEmail(subjects[session], buildEmailHtml(coaching, today), coaching, cfg);
 
-    // Store last brief in DB
+    // Persist in DB
     await dbSetMeta({
       [`last_coaching_brief_${session}`]: coaching,
       [`last_coaching_date_${session}`]:  new Date().toISOString(),
@@ -616,6 +658,8 @@ app.get("/coaching/latest", auth, async (req, res) => {
       date:           meta.last_coaching_date           || null,
       morningBrief:   meta.last_coaching_brief_morning  || null,
       morningDate:    meta.last_coaching_date_morning   || null,
+      middayBrief:    meta.last_coaching_brief_midday   || null,
+      middayDate:     meta.last_coaching_date_midday    || null,
       eveningBrief:   meta.last_coaching_brief_evening  || null,
       eveningDate:    meta.last_coaching_date_evening   || null,
     });
@@ -639,20 +683,28 @@ dbInit()
       console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
       console.log(`  CORS: ${ALLOWED.join(", ") || "all"}`);
 
-      // ── Two coaching crons: 5am ET (9am UTC) + 5pm ET (9pm UTC)
-      // Settings are re-read from DB on each fire, so dashboard changes take effect immediately
-      const cronAM = process.env.COACHING_CRON_AM || "0 9 * * *";  // 5am ET
-      const cronPM = process.env.COACHING_CRON_PM || "0 21 * * *"; // 5pm ET
+      // ── 3 daily coaching sessions (all times UTC):
+      //    5am  ET = 9am  UTC  → morning brief
+      //    12pm ET = 4pm  UTC  → midday check-in
+      //    5pm  ET = 9pm  UTC  → evening recap
+      const cronAM = process.env.COACHING_CRON_AM || "0 9 * * *";
+      const cronMD = process.env.COACHING_CRON_MD || "0 16 * * *";
+      const cronPM = process.env.COACHING_CRON_PM || "0 21 * * *";
       cron.schedule(cronAM, () => {
-        console.log("[cron] Firing morning brief (5am ET)...");
+        console.log("[cron] 5am ET — morning brief");
         runDailyCoaching("morning");
       }, { timezone: "UTC" });
+      cron.schedule(cronMD, () => {
+        console.log("[cron] 12pm ET — midday check-in");
+        runDailyCoaching("midday");
+      }, { timezone: "UTC" });
       cron.schedule(cronPM, () => {
-        console.log("[cron] Firing evening recap (5pm ET)...");
+        console.log("[cron] 5pm ET — evening recap");
         runDailyCoaching("evening");
       }, { timezone: "UTC" });
-      console.log(`  🌅 Morning brief cron: ${cronAM} UTC (5am ET)`);
-      console.log(`  🌙 Evening recap cron: ${cronPM} UTC (5pm ET)`);
+      console.log(`  🌅 Morning brief:    ${cronAM} UTC (5am ET)`);
+      console.log(`  ☀️  Midday check-in: ${cronMD} UTC (12pm ET)`);
+      console.log(`  🌙 Evening recap:    ${cronPM} UTC (5pm ET)`);
       console.log();
     });
   })
