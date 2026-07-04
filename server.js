@@ -662,7 +662,10 @@ async function runDailyCoaching(session = "morning") {
     const today = snapshots[0];
     const dataCtx = buildDataContext(snapshots);
 
-    const systemPrompt = `You are Brandon Bornancin's personal elite performance coach specializing in body recomposition. Brandon is a vegan founder with one mission: get from ~15-16% body fat to 10% while preserving lean mass. You have 30 days of his biometric data. You are direct, specific, and data-driven — not a generic chatbot. Every response references exact numbers from his data. You speak in a tone that is intense, results-focused, and motivating. Under 600 words. Use **bold** for key numbers and action items. Use markdown tables where helpful for scorecards.`;
+    // Always use the real current date for titles/subjects — never the stale syncDate from data
+    const nowDate = new Date().toLocaleDateString("en-US", { month: "long", day: "numeric" });
+
+    const systemPrompt = `You are Brandon Bornancin's personal elite performance coach specializing in body recomposition. Brandon is a vegan founder with one mission: get from ~15-16% body fat to 10% while preserving lean mass. You have 30 days of his biometric data. You are direct, specific, and data-driven — not a generic chatbot. Every response references exact numbers from his data. You speak in a tone that is intense, results-focused, and motivating. Under 600 words. Use **bold** for key numbers and action items. Use markdown tables where helpful for scorecards. Today's date is ${nowDate}.`;
 
     const userPrompt = buildSessionPrompt(session, dataCtx, today);
     const coaching = await callClaude(userPrompt, systemPrompt, cfg.anthropicKey);
@@ -672,18 +675,18 @@ async function runDailyCoaching(session = "morning") {
     if (cfg.ntfyTopic) {
       const preview = coaching.split("\n").filter(l => l.trim()).slice(0, 3).join(" ").slice(0, 200);
       const titles = {
-        morning: `🌅 5AM Brief — ${today.syncDate || "Today"}`,
-        midday:  `☀️ 12PM Check-In — ${today.syncDate || "Today"}`,
-        evening: `🌙 5PM Recap — ${today.syncDate || "Today"}`,
+        morning: `🌅 5AM Brief — ${nowDate}`,
+        midday:  `☀️ 12PM Check-In — ${nowDate}`,
+        evening: `🌙 5PM Recap — ${nowDate}`,
       };
       await sendPushNotification(titles[session] || "BioTrack Coach", preview, cfg.ntfyTopic);
     }
 
     // Email — full formatted version
     const subjects = {
-      morning: `🌅 BioTrack 5AM Brief — ${today.syncDate || new Date().toLocaleDateString()}`,
-      midday:  `☀️ BioTrack 12PM Check-In — ${today.syncDate || new Date().toLocaleDateString()}`,
-      evening: `🌙 BioTrack 5PM Recap — ${today.syncDate || new Date().toLocaleDateString()}`,
+      morning: `🌅 BioTrack 5AM Brief — ${nowDate}`,
+      midday:  `☀️ BioTrack 12PM Check-In — ${nowDate}`,
+      evening: `🌙 BioTrack 5PM Recap — ${nowDate}`,
     };
     await sendCoachingEmail(subjects[session], buildEmailHtml(coaching, today), coaching, cfg);
 
