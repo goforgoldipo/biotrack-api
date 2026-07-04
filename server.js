@@ -536,8 +536,8 @@ async function getCoachingSettings() {
     enabled:      meta.coaching_enabled !== "false",
     // 3 daily crons (UTC): 5am ET = 9 UTC, 12pm ET = 16 UTC, 5pm ET = 21 UTC
     cronMorning:  meta.coaching_cron_morning   || process.env.COACHING_CRON_AM   || "0 9 * * *",
-    cronMidday:   meta.coaching_cron_midday    || process.env.COACHING_CRON_MD   || "0 16 * * *",
-    cronEvening:  meta.coaching_cron_evening   || process.env.COACHING_CRON_PM   || "0 21 * * *",
+    cronMidday:   meta.coaching_cron_midday    || process.env.COACHING_CRON_MD   || "0 17 * * *",
+    cronEvening:  meta.coaching_cron_evening   || process.env.COACHING_CRON_PM   || "0 22 * * *",
   };
 }
 
@@ -733,29 +733,28 @@ dbInit()
       console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
       console.log(`  CORS: ${ALLOWED.join(", ") || "all"}`);
 
-      // ── 3 daily coaching sessions (all times UTC):
-      //    5am  ET = 9am  UTC  → morning brief
-      //    12pm ET = 4pm  UTC  → midday check-in
-      //    5pm  ET = 9pm  UTC  → evening recap
-      const cronAM = process.env.COACHING_CRON_AM || "0 9 * * *";
-      const cronMD = process.env.COACHING_CRON_MD || "0 16 * * *";
-      const cronPM = process.env.COACHING_CRON_PM || "0 21 * * *";
-      cron.schedule(cronAM, () => {
-        console.log("[cron] 5am ET — morning brief");
-        runDailyCoaching("morning");
-      }, { timezone: "UTC" });
-      cron.schedule(cronMD, () => {
-        console.log("[cron] 12pm ET — midday check-in");
-        runDailyCoaching("midday");
-      }, { timezone: "UTC" });
-      cron.schedule(cronPM, () => {
-        console.log("[cron] 5pm ET — evening recap");
-        runDailyCoaching("evening");
-      }, { timezone: "UTC" });
-      console.log(`  🌅 Morning brief:    ${cronAM} UTC (5am ET)`);
-      console.log(`  ☀️  Midday check-in: ${cronMD} UTC (12pm ET)`);
-      console.log(`  🌙 Evening recap:    ${cronPM} UTC (5pm ET)`);
-      console.log();
+      // ── 3 daily coaching sessions — schedule read from DB so /coaching/settings changes take effect on redeploy
+      getCoachingSettings().then(cfg => {
+        const cronAM = cfg.cronMorning;
+        const cronMD = cfg.cronMidday;
+        const cronPM = cfg.cronEvening;
+        cron.schedule(cronAM, () => {
+          console.log("[cron] morning brief");
+          runDailyCoaching("morning");
+        }, { timezone: "UTC" });
+        cron.schedule(cronMD, () => {
+          console.log("[cron] midday check-in");
+          runDailyCoaching("midday");
+        }, { timezone: "UTC" });
+        cron.schedule(cronPM, () => {
+          console.log("[cron] evening recap");
+          runDailyCoaching("evening");
+        }, { timezone: "UTC" });
+        console.log(`  🌅 Morning brief:    ${cronAM} UTC`);
+        console.log(`  ☀️  Midday check-in: ${cronMD} UTC`);
+        console.log(`  🌙 Evening recap:    ${cronPM} UTC`);
+        console.log();
+      });
     });
   })
   .catch(e => {
