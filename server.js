@@ -429,10 +429,21 @@ function buildDataContext(snapshots) {
     return vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : "—";
   };
 
-  // Calorie deficit estimate (active - consumed)
-  const netCal = (today.calsBurned != null && today.calories != null)
-    ? (today.calsBurned - today.calories).toFixed(0)
+  // Field aliases — handle both old and new field names
+  const activeCal  = today.activeCalories ?? today.calsBurned ?? null;
+  const totalBurn  = today.totalCaloriesBurned ?? (activeCal != null && today.basalCalories != null ? activeCal + today.basalCalories : activeCal);
+  const sleepHours = today.sleepDuration ?? today.sleepDur ?? null;
+
+  // Calorie deficit estimate (total burn - consumed)
+  const netCal = (totalBurn != null && today.calories != null)
+    ? (totalBurn - today.calories).toFixed(0)
     : null;
+
+  // avg helper that checks both field name variants
+  const avgDual = (key1, key2, days = snapshots.length) => {
+    const vals = snapshots.slice(0, days).map(s => s[key1] ?? s[key2]).filter(v => typeof v === "number");
+    return vals.length ? (vals.reduce((a,b) => a+b,0) / vals.length).toFixed(1) : "—";
+  };
 
   return `
 ATHLETE PROFILE: Brandon Bornancin
@@ -445,11 +456,11 @@ ESTIMATED WEEKS TO 10% BF (at current pace): ${weeksToGoal}
 Weight:       ${fmt(today.weight," lbs")}    |  Body Fat:    ${fmt(today.bodyFat,"%")}
 Lean Mass:    ${fmt(today.leanMass," lbs")}  |  Fat Mass:    ${fmt(today.fatMass," lbs")}
 HRV:          ${fmt(today.hrv," ms")}        |  Resting HR:  ${fmt(today.restingHR," bpm")}
-Sleep:        ${fmt(today.sleepDur,"h")}     |  Deep Sleep:  ${fmt(today.deepSleep," min")}
-Steps:        ${fmt(today.steps)}            |  Active Cal:  ${fmt(today.calsBurned," kcal")}
+Sleep:        ${fmt(sleepHours,"h")}         |  Deep Sleep:  ${fmt(today.deepSleep," min")}
+Steps:        ${fmt(today.steps)}            |  Total Burn:  ${fmt(totalBurn," kcal")}
 Calories In:  ${fmt(today.calories," kcal")} |  Protein:     ${fmt(today.protein,"g")}
 Carbs:        ${fmt(today.carbs,"g")}        |  Fat:         ${fmt(today.fat,"g")}
-Net Cal:      ${netCal != null ? netCal + " kcal (surplus if +, deficit if -)" : "—"}
+Water:        ${fmt(today.water," oz")}      |  Net Cal:     ${netCal != null ? netCal + " kcal" : "—"}
 Workout Vol:  ${fmt(today.workoutVol," lbs")} | Duration:   ${fmt(today.workoutDur," min")}
 VO2 Max:      ${fmt(today.vo2max)}           |  SpO2:        ${fmt(today.spo2,"%")}
 
@@ -458,11 +469,11 @@ VO2 Max:      ${fmt(today.vo2max)}           |  SpO2:        ${fmt(today.spo2,"%
 Weight:           ${avg("weight",7)} lbs    |  ${avg("weight")} lbs
 Body Fat:         ${avg("bodyFat",7)}%      |  ${avg("bodyFat")}%
 HRV:              ${avg("hrv",7)} ms        |  ${avg("hrv")} ms
-Sleep:            ${avg("sleepDur",7)}h     |  ${avg("sleepDur")}h
+Sleep:            ${avgDual("sleepDuration","sleepDur",7)}h  |  ${avgDual("sleepDuration","sleepDur")}h
 Steps:            ${avg("steps",7)}         |  ${avg("steps")}
 Protein:          ${avg("protein",7)}g      |  ${avg("protein")}g
 Calories In:      ${avg("calories",7)} kcal |  ${avg("calories")} kcal
-Active Cal Burn:  ${avg("calsBurned",7)} kcal| ${avg("calsBurned")} kcal
+Total Cal Burn:   ${avgDual("totalCaloriesBurned","activeCalories",7)} kcal | ${avgDual("totalCaloriesBurned","activeCalories")} kcal
 
 ━━ WEEK-OVER-WEEK TREND ━━
 This week vs last week:
@@ -473,7 +484,10 @@ This week vs last week:
   HRV:      ${weekAvg(week1,"hrv")} ms → ${weekAvg(week2,"hrv")} ms (prev)
 
 ━━ LAST 14 DAYS (daily) ━━
-${snapshots.slice(0,14).map(s => `  ${(s.syncDate||"").padEnd(12)} W:${fmt(s.weight,"lbs").padEnd(10)} BF:${fmt(s.bodyFat,"%").padEnd(7)} HRV:${fmt(s.hrv,"ms").padEnd(8)} Steps:${fmt(s.steps).padEnd(7)} Pro:${fmt(s.protein,"g")}`).join("\n")}
+${snapshots.slice(0,14).map(s => {
+  const sl = s.sleepDuration ?? s.sleepDur;
+  return `  ${(s.syncDate||"").padEnd(12)} W:${fmt(s.weight,"lbs").padEnd(10)} BF:${fmt(s.bodyFat,"%").padEnd(7)} HRV:${fmt(s.hrv,"ms").padEnd(8)} Sleep:${sl != null ? sl.toFixed(1)+"h" : "—"} Steps:${fmt(s.steps).padEnd(7)} Pro:${fmt(s.protein,"g")} Cal:${fmt(s.calories,"kcal")}`;
+}).join("\n")}
 `.trim();
 }
 
