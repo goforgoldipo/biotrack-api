@@ -389,7 +389,7 @@ async function sendCoachingEmail(subject, htmlContent, textContent, cfg) {
   if (resendKey) {
     const resend = new Resend(resendKey);
     await resend.emails.send({
-      from: "BioTrack Coach <onboarding@resend.dev>",
+      from: "BioTrack Coach <coach@sellmore.me>",
       to: toEmail,
       subject,
       html: htmlContent,
