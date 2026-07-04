@@ -405,35 +405,75 @@ async function sendCoachingEmail(subject, htmlContent, textContent, cfg) {
 function buildDataContext(snapshots) {
   const today = snapshots[0] || {};
   const fmt = (v, unit="") => v != null ? `${typeof v === "number" ? v.toFixed(1) : v}${unit}` : "—";
-  const avg = (key) => {
-    const vals = snapshots.map(s => s[key]).filter(v => typeof v === "number");
+  const avg = (key, days = snapshots.length) => {
+    const vals = snapshots.slice(0, days).map(s => s[key]).filter(v => typeof v === "number");
     return vals.length ? (vals.reduce((a,b) => a+b,0) / vals.length).toFixed(1) : "—";
   };
 
+  // BF trend: first vs last available reading
+  const bfReadings = snapshots.filter(s => s.bodyFat != null);
+  const bfChange = bfReadings.length >= 2
+    ? (bfReadings[0].bodyFat - bfReadings[bfReadings.length - 1].bodyFat).toFixed(2)
+    : null;
+  const bfCurrent = today.bodyFat;
+  const bfTarget = 10;
+  const weeksToGoal = bfCurrent != null && bfChange != null && parseFloat(bfChange) > 0
+    ? Math.ceil((bfCurrent - bfTarget) / (parseFloat(bfChange) / (bfReadings.length / 7))).toString()
+    : "unknown";
+
+  // Weekly averages for trend
+  const week1 = snapshots.slice(0, 7);
+  const week2 = snapshots.slice(7, 14);
+  const weekAvg = (arr, key) => {
+    const vals = arr.map(s => s[key]).filter(v => typeof v === "number");
+    return vals.length ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : "—";
+  };
+
+  // Calorie deficit estimate (active - consumed)
+  const netCal = (today.calsBurned != null && today.calories != null)
+    ? (today.calsBurned - today.calories).toFixed(0)
+    : null;
+
   return `
 ATHLETE PROFILE: Brandon Bornancin
-PRIMARY GOAL: Reach 10% body fat while preserving lean mass. Currently at ${fmt(today.bodyFat,"%")} BF.
+PRIMARY GOAL: Reach 10% body fat (currently ${fmt(bfCurrent,"%")} BF — ${bfCurrent != null ? (bfCurrent - bfTarget).toFixed(1) : "?"} points to go)
 DIET: Vegan, whole food plant-based
 LAST SYNC: ${today.syncDate || "unknown"}
+ESTIMATED WEEKS TO 10% BF (at current pace): ${weeksToGoal}
 
 ━━ TODAY'S METRICS ━━
-Weight:       ${fmt(today.weight," lbs")}   |  Body Fat:    ${fmt(today.bodyFat,"%")}
-Lean Mass:    ${fmt(today.leanMass," lbs")} |  Fat Mass:    ${fmt(today.fatMass," lbs")}
-HRV:          ${fmt(today.hrv," ms")}       |  Resting HR:  ${fmt(today.restingHR," bpm")}
-Sleep:        ${fmt(today.sleepDur,"h")}    |  Deep Sleep:  ${fmt(today.deepSleep," min")}
-Steps:        ${fmt(today.steps)}           |  Active Cal:  ${fmt(today.calsBurned," kcal")}
-Calories:     ${fmt(today.calories," kcal")}|  Protein:     ${fmt(today.protein,"g")}
-Carbs:        ${fmt(today.carbs,"g")}       |  Fat:         ${fmt(today.fat,"g")}
-Workout Vol:  ${fmt(today.workoutVol," lbs")}| Duration:    ${fmt(today.workoutDur," min")}
-VO2 Max:      ${fmt(today.vo2max)}          |  SpO2:        ${fmt(today.spo2,"%")}
+Weight:       ${fmt(today.weight," lbs")}    |  Body Fat:    ${fmt(today.bodyFat,"%")}
+Lean Mass:    ${fmt(today.leanMass," lbs")}  |  Fat Mass:    ${fmt(today.fatMass," lbs")}
+HRV:          ${fmt(today.hrv," ms")}        |  Resting HR:  ${fmt(today.restingHR," bpm")}
+Sleep:        ${fmt(today.sleepDur,"h")}     |  Deep Sleep:  ${fmt(today.deepSleep," min")}
+Steps:        ${fmt(today.steps)}            |  Active Cal:  ${fmt(today.calsBurned," kcal")}
+Calories In:  ${fmt(today.calories," kcal")} |  Protein:     ${fmt(today.protein,"g")}
+Carbs:        ${fmt(today.carbs,"g")}        |  Fat:         ${fmt(today.fat,"g")}
+Net Cal:      ${netCal != null ? netCal + " kcal (surplus if +, deficit if -)" : "—"}
+Workout Vol:  ${fmt(today.workoutVol," lbs")} | Duration:   ${fmt(today.workoutDur," min")}
+VO2 Max:      ${fmt(today.vo2max)}           |  SpO2:        ${fmt(today.spo2,"%")}
 
-━━ 30-DAY AVERAGES ━━
-Avg Weight: ${avg("weight")} lbs  |  Avg BF: ${avg("bodyFat")}%  |  Avg HRV: ${avg("hrv")} ms
-Avg Sleep: ${avg("sleepDur")}h    |  Avg Steps: ${avg("steps")}  |  Avg Protein: ${avg("protein")}g
-Avg Calories: ${avg("calories")} kcal  |  Avg Workout Vol: ${avg("workoutVol")} lbs
+━━ 7-DAY vs 30-DAY AVERAGES ━━
+                  7-Day Avg   |  30-Day Avg
+Weight:           ${avg("weight",7)} lbs    |  ${avg("weight")} lbs
+Body Fat:         ${avg("bodyFat",7)}%      |  ${avg("bodyFat")}%
+HRV:              ${avg("hrv",7)} ms        |  ${avg("hrv")} ms
+Sleep:            ${avg("sleepDur",7)}h     |  ${avg("sleepDur")}h
+Steps:            ${avg("steps",7)}         |  ${avg("steps")}
+Protein:          ${avg("protein",7)}g      |  ${avg("protein")}g
+Calories In:      ${avg("calories",7)} kcal |  ${avg("calories")} kcal
+Active Cal Burn:  ${avg("calsBurned",7)} kcal| ${avg("calsBurned")} kcal
 
-━━ TREND (last 7 days weight) ━━
-${snapshots.slice(0,7).map(s => `  ${s.syncDate||""}: ${fmt(s.weight," lbs")} | BF: ${fmt(s.bodyFat,"%")} | HRV: ${fmt(s.hrv," ms")}`).join("\n")}
+━━ WEEK-OVER-WEEK TREND ━━
+This week vs last week:
+  BF%:      ${weekAvg(week1,"bodyFat")}% → ${weekAvg(week2,"bodyFat")}% (prev)
+  Weight:   ${weekAvg(week1,"weight")} lbs → ${weekAvg(week2,"weight")} lbs (prev)
+  Protein:  ${weekAvg(week1,"protein")}g → ${weekAvg(week2,"protein")}g (prev)
+  Steps:    ${weekAvg(week1,"steps")} → ${weekAvg(week2,"steps")} (prev)
+  HRV:      ${weekAvg(week1,"hrv")} ms → ${weekAvg(week2,"hrv")} ms (prev)
+
+━━ LAST 14 DAYS (daily) ━━
+${snapshots.slice(0,14).map(s => `  ${(s.syncDate||"").padEnd(12)} W:${fmt(s.weight,"lbs").padEnd(10)} BF:${fmt(s.bodyFat,"%").padEnd(7)} HRV:${fmt(s.hrv,"ms").padEnd(8)} Steps:${fmt(s.steps).padEnd(7)} Pro:${fmt(s.protein,"g")}`).join("\n")}
 `.trim();
 }
 
@@ -542,46 +582,56 @@ app.get("/coaching/settings", auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-function buildSessionPrompt(session, dataCtx) {
+function buildSessionPrompt(session, dataCtx, today) {
   const goals = BRANDON_GOALS;
+  const bf    = today && today.bodyFat != null ? today.bodyFat.toFixed(1) : "unknown";
+  const steps = today && today.steps   != null ? Math.round(today.steps)  : 0;
+  const stepsNeeded = Math.max(0, 10000 - steps);
+
   if (session === "morning") return `${dataCtx}
 
 ${goals}
 
-🌅 5AM MORNING BRIEF — set Brandon up to win the day:
-1. **Readiness Score** — HRV / sleep / resting HR → Green (train hard), Yellow (moderate), or Red (recover). Be specific with the numbers.
-2. **Goal Tracker** — for EACH goal (BF%, steps, protein, sleep, weight pace) tell him: ✅ on track or ⚠️ behind, with the exact number vs target.
-3. **Training Plan** — should he train today? Which muscle groups? Intensity level (heavy/moderate/light/rest)? What time is optimal given his HRV?
-4. **Nutrition Blueprint** — exact calorie target and protein gram target for today. What to prioritize at breakfast and lunch to hit protein early.
-5. **#1 Action Right Now** — the single most impactful thing to do in the next hour to stay on track for 10% BF.
+🌅 5AM MORNING BRIEF — set Brandon up to WIN today and move toward 10% BF:
+1. **Readiness Score** — HRV / sleep / resting HR → score Green (train hard), Yellow (moderate), or Red (recover only). Cite exact numbers and what they mean for today.
+2. **10% BF Roadmap Check** — he is currently at ${bf}% BF. At this week's pace (use the week-over-week trend), how many weeks to reach 10%? Is he ahead or behind the 0.5-1 lb/week fat loss target?
+3. **Today's Training Plan** — train or rest? If train: which muscle groups, how heavy, target volume. Optimal time window given HRV.
+4. **Nutrition Blueprint** — exact calorie target, exact protein target (in grams). What to eat for breakfast RIGHT NOW to front-load protein. Specific vegan foods/combos to hit 180g today.
+5. **#1 Lever to Pull Today** — the single highest-impact action in the next hour that directly accelerates getting to 10% BF.
 
-Sharp, specific, data-driven. This is his 5am launchpad.`;
+Under 500 words. Data-specific. No fluff.`;
 
   if (session === "midday") return `${dataCtx}
 
 ${goals}
 
-☀️ 12PM MIDDAY CHECK-IN — how is Brandon doing vs his daily goals RIGHT NOW:
-1. **Steps Pace Check** — he has ${Math.round(0)} steps so far. At this pace, will he hit 10,000 today? How many does he need in the next hour to stay on pace?
-2. **Nutrition Check** — based on yesterday's protein/calorie data, is he typically ahead or behind at midday? What should he eat RIGHT NOW for lunch to stay on target?
-3. **Energy & Recovery** — based on HRV and sleep data, how is his energy likely holding up? Any signs of overtraining or under-recovery?
-4. **Afternoon Training Window** — if he hasn't trained yet, what's the optimal workout for this afternoon? Give him a specific plan.
-5. **Body Comp Momentum** — is today on track to contribute to reaching 10% BF? What is the one thing he can do in the next 4 hours to guarantee today is a win?
+☀️ 12PM MIDDAY CHECK-IN — is Brandon on pace RIGHT NOW?
+1. **Steps Audit** — today's data shows ${steps} steps logged as of last sync. He needs 10,000. That means ${stepsNeeded} more steps today. Is he on pace? How many steps/hour does he need for the rest of the day?
+2. **Protein/Calorie Status** — based on today's logged intake vs his 30-day pattern, estimate where he is right now. What should he eat for lunch RIGHT NOW to stay on track? Specific vegan meal.
+3. **HRV & Energy Read** — how is his recovery/energy holding today based on morning HRV and sleep? Any adjustments to afternoon plans?
+4. **Afternoon Training Window** — should he train this afternoon? If yes: exact workout (exercise, sets, reps). If no: why not and what to do instead.
+5. **10% BF: Today's Make-or-Break** — what is the ONE thing he can do between now and 5pm that most directly moves the needle toward 10% BF?
 
-This is his midday course correction. Be direct — is he winning or losing today?`;
+Be direct. Is today a fat-loss day or a fat-gain day based on current trajectory?`;
 
   return `${dataCtx}
 
 ${goals}
 
-🌙 5PM EVENING PERFORMANCE REVIEW — grade today and plan tomorrow:
-1. **Daily Scorecard** — grade each goal (A/B/C/D/F): steps vs 10k, protein vs 180g, calories vs target, sleep from last night, training completed. Overall day grade.
-2. **Body Comp Impact** — was today a fat-loss day or not? Based on the data, did today move him toward 10% BF or away from it? By how much?
-3. **What to Do TONIGHT** — exact recovery actions: sleep time target, evening meal (if any), wind-down protocol to maximize HRV tomorrow.
-4. **Tomorrow's Pre-Plan** — based on today's data, exactly what should tomorrow look like? Training Y/N, calorie target, protein target, step target.
-5. **Progress Update** — current BF% is ${0}%. Goal is 10%. At this week's pace, he hits 10% in approximately X weeks. What needs to change to get there faster?
+🌙 5PM EVENING PERFORMANCE REVIEW — grade the day, lock in tomorrow:
+1. **Daily Scorecard** — grade each metric A/B/C/D/F with the actual number vs target:
+   - Steps: ${steps} vs 10,000
+   - Protein: vs 180g
+   - Calories: vs 2,200 (deficit) or 2,600 (maintenance)
+   - Sleep last night: vs 7.5h
+   - Training: completed or skipped
+   - Overall day grade for BF progress
+2. **Body Comp Impact** — based on today's calorie balance and activity, was today a fat-burning day or not? Estimate how much fat (oz or grams) was lost or gained today. How does this affect the weeks-to-10% timeline?
+3. **Tonight's Recovery Protocol** — exact bedtime to target, any evening meal (what + macros), wind-down actions to maximize HRV tomorrow.
+4. **Tomorrow Pre-loaded** — based on today's data gaps and wins, tomorrow's exact plan: train or rest, calorie target, protein target, step strategy, one priority.
+5. **Weekly Progress Verdict** — current BF is ${bf}%. Use the 7-day trend to project: is he on track for 10% within a reasonable timeframe? What single habit change would most accelerate the timeline?
 
-Be brutally honest. No participation trophies. If today was bad, say so and tell him exactly how to fix it tomorrow.`;
+Brutally honest. No participation trophies. Name exactly what went wrong and how to fix it.`;
 }
 
 async function runDailyCoaching(session = "morning") {
@@ -598,9 +648,9 @@ async function runDailyCoaching(session = "morning") {
     const today = snapshots[0];
     const dataCtx = buildDataContext(snapshots);
 
-    const systemPrompt = `You are Brandon Bornancin's personal elite performance coach specializing in body recomposition. Brandon is a vegan founder with one mission: get from ~15-16% body fat to 10% while preserving lean mass. You have 30 days of his biometric data. You are direct, specific, and data-driven — not a generic chatbot. Every response references exact numbers from his data. You speak in a tone that is intense, results-focused, and motivating. Under 500 words. Use **bold** for key numbers and action items.`;
+    const systemPrompt = `You are Brandon Bornancin's personal elite performance coach specializing in body recomposition. Brandon is a vegan founder with one mission: get from ~15-16% body fat to 10% while preserving lean mass. You have 30 days of his biometric data. You are direct, specific, and data-driven — not a generic chatbot. Every response references exact numbers from his data. You speak in a tone that is intense, results-focused, and motivating. Under 600 words. Use **bold** for key numbers and action items. Use markdown tables where helpful for scorecards.`;
 
-    const userPrompt = buildSessionPrompt(session, dataCtx);
+    const userPrompt = buildSessionPrompt(session, dataCtx, today);
     const coaching = await callClaude(userPrompt, systemPrompt, cfg.anthropicKey);
     console.log(`[coaching] Claude ${session} response received`);
 
