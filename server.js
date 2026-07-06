@@ -497,28 +497,28 @@ function buildEmailHtml(coachingText, today) {
   const hrv = today.hrv    != null ? today.hrv.toFixed(0)     : "—";
   const paragraphs = coachingText
     .split(/\n\n+/)
-    .map(p => `<p style="margin:0 0 16px;line-height:1.7;color:#e0e0e0">${p.replace(/\n/g,"<br>").replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/^#{1,3}\s+(.+)$/gm, "<strong style='color:#00ff9d'>$1</strong>")}</p>`)
+    .map(p => `<p style="margin:0 0 16px;line-height:1.7;color:#111111">${p.replace(/\n/g,"<br>").replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/^#{1,3}\s+(.+)$/gm, "<strong>$1</strong>")}</p>`)
     .join("");
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:0;background:#07070e;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
   <div style="max-width:640px;margin:0 auto;padding:32px 24px">
     <div style="text-align:center;margin-bottom:32px">
-      <div style="font-size:28px;font-weight:900;color:#00ff9d;letter-spacing:3px">⬡ BIOTRACK</div>
-      <div style="font-size:13px;color:#666;letter-spacing:2px;margin-top:4px">DAILY COACHING BRIEF</div>
+      <div style="font-size:24px;font-weight:900;color:#111111;letter-spacing:3px">⬡ BIOTRACK</div>
+      <div style="font-size:12px;color:#666666;letter-spacing:2px;margin-top:4px">DAILY COACHING BRIEF</div>
     </div>
     <div style="display:flex;gap:12px;margin-bottom:28px;justify-content:center">
       ${[["⚖️","Weight",w+" lbs"],["🔥","Body Fat",bf+"%"],["🧬","HRV",hrv+" ms"]].map(([icon,label,val])=>`
-      <div style="flex:1;background:#0f0f1a;border:1px solid #1e1e2e;border-radius:10px;padding:16px;text-align:center;min-width:120px">
+      <div style="flex:1;background:#ffffff;border:1px solid #dddddd;border-radius:10px;padding:16px;text-align:center;min-width:100px">
         <div style="font-size:22px">${icon}</div>
-        <div style="font-size:20px;font-weight:700;color:#f0f0f0;margin:4px 0">${val}</div>
-        <div style="font-size:10px;color:#666;letter-spacing:1px">${label.toUpperCase()}</div>
+        <div style="font-size:18px;font-weight:700;color:#111111;margin:4px 0">${val}</div>
+        <div style="font-size:10px;color:#888888;letter-spacing:1px">${label.toUpperCase()}</div>
       </div>`).join("")}
     </div>
-    <div style="background:#0f0f1a;border:1px solid #1e1e2e;border-radius:12px;padding:24px;margin-bottom:24px">
+    <div style="background:#ffffff;border:1px solid #dddddd;border-radius:12px;padding:24px;margin-bottom:24px">
       ${paragraphs}
     </div>
-    <div style="text-align:center;font-size:11px;color:#333;padding-top:16px;border-top:1px solid #1e1e2e">
-      BioTrack · Your personal health AI · <a href="https://biotrack-dashboard.vercel.app" style="color:#00ff9d">View Dashboard</a>
+    <div style="text-align:center;font-size:11px;color:#999999;padding-top:16px;border-top:1px solid #dddddd">
+      BioTrack · Your personal health AI · <a href="https://biotrack-dashboard.vercel.app" style="color:#333333">View Dashboard</a>
     </div>
   </div>
 </body></html>`;
