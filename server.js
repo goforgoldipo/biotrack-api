@@ -280,24 +280,6 @@ app.post("/meta", auth, async (req, res) => {
 });
 
 // GET /health (no auth)
-// POST /backfill-calories — one-time: derive calories from macros for all snapshots missing calories
-app.post("/backfill-calories", auth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT id, data FROM snapshots`);
-    let updated = 0, skipped = 0;
-    for (const row of rows) {
-      const d = row.data;
-      if (d.calories != null) { skipped++; continue; }
-      const p = d.protein, c = d.carbs, f = d.fat;
-      if (p == null || c == null || f == null) { skipped++; continue; }
-      const calories = (p * 4) + (c * 4) + (f * 9);
-      const newData = { ...d, calories };
-      await pool.query(`UPDATE snapshots SET data = $1 WHERE id = $2`, [JSON.stringify(newData), row.id]);
-      updated++;
-    }
-    res.json({ ok: true, updated, skipped, total: rows.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
 app.get("/health", async (_req, res) => {
   try {
