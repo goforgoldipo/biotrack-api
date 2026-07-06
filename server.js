@@ -500,7 +500,7 @@ function buildEmailHtml(coachingText, today) {
     .map(p => `<p style="margin:0 0 16px;line-height:1.7;color:#111111">${p.replace(/\n/g,"<br>").replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>").replace(/^#{1,3}\s+(.+)$/gm, "<strong>$1</strong>")}</p>`)
     .join("");
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light"><style>:root{color-scheme:light}body{color-scheme:light}</style></head><body style="margin:0;padding:0;background:#f4f4f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color-scheme:light">
   <div style="max-width:640px;margin:0 auto;padding:32px 24px">
     <div style="text-align:center;margin-bottom:32px">
       <div style="font-size:24px;font-weight:900;color:#111111;letter-spacing:3px">⬡ BIOTRACK</div>
