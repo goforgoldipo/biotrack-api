@@ -279,6 +279,71 @@ app.post("/meta", auth, async (req, res) => {
   }
 });
 
+// POST /nutrition — patch today's (or a specific date's) snapshot with MFP nutrition data.
+// Called by the local import-mfp.py script. Creates a new snapshot if none exists for the date.
+app.post("/nutrition", auth, async (req, res) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== "object") return res.status(400).json({ error: "Body must be JSON object" });
+
+    const targetDate = body.syncDate; // e.g. "Jul 6"
+    if (!targetDate) return res.status(400).json({ error: "syncDate required" });
+
+    // Find the most recent snapshot for this date
+    const { rows } = await pool.query(
+      `SELECT id, data FROM snapshots WHERE sync_date = $1 ORDER BY received_at DESC LIMIT 1`,
+      [targetDate]
+    );
+
+    const nutritionFields = {
+      calories: body.calories,
+      protein:  body.protein,
+      carbs:    body.carbs,
+      fat:      body.fat,
+      fiber:    body.fiber,
+      sugar:    body.sugar,
+      sodium:   body.sodium,
+      water:    body.water,
+      breakfastCals: body.breakfastCals,
+      lunchCals:     body.lunchCals,
+      dinnerCals:    body.dinnerCals,
+      snackCals:     body.snackCals,
+      breakfastTime: body.breakfastTime,
+      lunchTime:     body.lunchTime,
+      dinnerTime:    body.dinnerTime,
+      lastMealTime:  body.lastMealTime,
+      mfpMeals:      body.mfpMeals, // full per-meal breakdown JSON
+    };
+    // Strip undefined fields
+    Object.keys(nutritionFields).forEach(k => nutritionFields[k] == null && delete nutritionFields[k]);
+
+    if (rows.length > 0) {
+      // Patch existing snapshot
+      const existing = rows[0].data;
+      const updated  = { ...existing, ...nutritionFields, _nutritionUpdatedAt: new Date().toISOString() };
+      await pool.query(`UPDATE snapshots SET data = $1 WHERE id = $2`, [JSON.stringify(updated), rows[0].id]);
+      console.log(`[nutrition] Patched ${targetDate} snapshot (id ${rows[0].id}) with ${Object.keys(nutritionFields).length} fields`);
+      return res.json({ ok: true, action: "patched", date: targetDate, fields: Object.keys(nutritionFields) });
+    } else {
+      // No snapshot for this date — create a nutrition-only record
+      const snap = {
+        ...nutritionFields,
+        syncDate: targetDate,
+        syncTime: body.syncTime || "imported",
+        _receivedAt: new Date().toISOString(),
+        _id: crypto.randomUUID(),
+        _source: "mfp-import",
+      };
+      await dbInsertSnapshot(snap);
+      console.log(`[nutrition] Created new snapshot for ${targetDate} with ${Object.keys(nutritionFields).length} nutrition fields`);
+      return res.json({ ok: true, action: "created", date: targetDate, fields: Object.keys(nutritionFields) });
+    }
+  } catch (e) {
+    console.error("/nutrition error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /health (no auth)
 
 app.get("/health", async (_req, res) => {
