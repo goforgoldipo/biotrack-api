@@ -40,6 +40,19 @@ async function dbInit() {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id           TEXT PRIMARY KEY,
+      email        TEXT UNIQUE NOT NULL,
+      username     TEXT UNIQUE,
+      display_name TEXT,
+      avatar_url   TEXT,
+      is_public    BOOLEAN NOT NULL DEFAULT false,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id);
+    CREATE INDEX IF NOT EXISTS idx_snap_user ON snapshots (user_id, received_at DESC);
   `);
   console.log("  ✓ DB tables ready");
 }
@@ -153,6 +166,8 @@ function dedupHistory(rawSnaps, days) {
 // ── CORS
 const ALLOWED = [
   process.env.ALLOWED_ORIGIN,
+  "https://biotrack-dashboard.vercel.app",
+  "https://biotrack.app",
   "http://localhost:5173",
   "http://localhost:3000",
 ].filter(Boolean);
@@ -161,10 +176,12 @@ app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
     if (ALLOWED.includes(origin)) return cb(null, true);
+    // Allow any *.vercel.app preview deployments
+    if (origin.endsWith(".vercel.app")) return cb(null, true);
     cb(new Error(`CORS: origin ${origin} not allowed`));
   },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "x-api-secret"],
+  methods: ["GET", "POST", "PUT", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "x-api-secret", "Authorization"],
 }));
 app.use(express.json({ limit: "4mb" }));
 
@@ -799,6 +816,155 @@ app.get("/coaching/latest", auth, async (req, res) => {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// USER / COMMUNITY ROUTES  (multi-user support)
+// ─────────────────────────────────────────────────────────────────
+
+// Lightweight Clerk JWT verification using JWKS
+async function verifyClerkJWT(token) {
+  if (!token) return null;
+  try {
+    const [headerB64] = token.split(".");
+    const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
+    const kid = header.kid;
+    // Fetch JWKS from Clerk
+    const clerkDomain = process.env.CLERK_DOMAIN || "";
+    if (!clerkDomain) return null;
+    const jwksRes = await fetch(`https://${clerkDomain}/.well-known/jwks.json`);
+    const { keys } = await jwksRes.json();
+    const jwk = keys.find(k => k.kid === kid);
+    if (!jwk) return null;
+    // Import key and verify
+    const { createVerify } = require("crypto");
+    const { createPublicKey } = require("crypto");
+    const publicKey = createPublicKey({ key: jwk, format: "jwk" });
+    const [hdr, payload, sig] = token.split(".");
+    const data = `${hdr}.${payload}`;
+    const verify = createVerify("RSA-SHA256");
+    verify.update(data);
+    const valid = verify.verify(publicKey, sig, "base64url");
+    if (!valid) return null;
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString());
+    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
+    return claims;
+  } catch { return null; }
+}
+
+// POST /users/upsert — create or update user from Clerk session
+app.post("/users/upsert", async (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    const claims = await verifyClerkJWT(token);
+    // Fallback: allow legacy secret for Brandon's own account migration
+    const isLegacy = !claims && req.headers["x-api-secret"] === SECRET;
+    if (!claims && !isLegacy) return res.status(401).json({ error: "Unauthorized" });
+
+    const userId = claims ? claims.sub : "legacy_brandon";
+    const { username, display_name, is_public, avatar_url } = req.body;
+
+    // Get email from claims
+    const email = claims?.email || claims?.primary_email_address || req.body.email || `${userId}@biotrack.app`;
+
+    await pool.query(`
+      INSERT INTO users (id, email, username, display_name, avatar_url, is_public)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (id) DO UPDATE SET
+        email        = EXCLUDED.email,
+        username     = COALESCE(NULLIF(EXCLUDED.username,''), users.username),
+        display_name = COALESCE(NULLIF(EXCLUDED.display_name,''), users.display_name),
+        avatar_url   = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+        is_public    = EXCLUDED.is_public
+    `, [userId, email, username||null, display_name||null, avatar_url||null, is_public||false]);
+
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
+    res.json({ ok: true, user: rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /users/me — return own profile
+app.get("/users/me", async (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    const claims = await verifyClerkJWT(token);
+    if (!claims) return res.status(401).json({ error: "Unauthorized" });
+    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [claims.sub]);
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /community — list all public users + their latest snapshot summary
+app.get("/community", async (_req, res) => {
+  try {
+    const { rows: users } = await pool.query(
+      `SELECT u.id, u.username, u.display_name, u.avatar_url,
+              s.data as latest
+       FROM users u
+       LEFT JOIN LATERAL (
+         SELECT data FROM snapshots
+         WHERE user_id = u.id
+         ORDER BY received_at DESC LIMIT 1
+       ) s ON true
+       WHERE u.is_public = true AND u.username IS NOT NULL
+       ORDER BY u.created_at DESC`
+    );
+    res.json({ users });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /community/leaderboard?metric=hrv&range=30d
+app.get("/community/leaderboard", async (req, res) => {
+  try {
+    const metric = req.query.metric || "hrv";
+    const days = req.query.range === "7d" ? 7 : req.query.range === "90d" ? 90 : 30;
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    // Get average of metric over period for each public user
+    const { rows } = await pool.query(
+      `SELECT u.id, u.username, u.display_name, u.avatar_url,
+              AVG((s.data->$1)::numeric) as metric_avg,
+              (SELECT data FROM snapshots WHERE user_id=u.id ORDER BY received_at DESC LIMIT 1) as latest
+       FROM users u
+       JOIN snapshots s ON s.user_id = u.id
+       WHERE u.is_public = true
+         AND u.username IS NOT NULL
+         AND s.received_at >= $2
+         AND s.data->$1 IS NOT NULL
+       GROUP BY u.id, u.username, u.display_name, u.avatar_url
+       ORDER BY metric_avg DESC`,
+      [metric, since]
+    );
+    // Add metric value to latest for display
+    const users = rows.map(r => ({
+      id: r.id, username: r.username, display_name: r.display_name, avatar_url: r.avatar_url,
+      latest: { ...(r.latest||{}), [metric]: r.metric_avg ? +parseFloat(r.metric_avg).toFixed(2) : null }
+    }));
+    res.json({ metric, range: req.query.range||"30d", users });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /community/:username — public profile data
+app.get("/community/:username", async (req, res) => {
+  try {
+    const { rows: userRows } = await pool.query(
+      "SELECT * FROM users WHERE username=$1 AND is_public=true", [req.params.username]
+    );
+    if (!userRows.length) return res.status(404).json({ error: "Profile not found" });
+    const user = userRows[0];
+
+    const { rows: snapRows } = await pool.query(
+      `SELECT data FROM snapshots WHERE user_id=$1 ORDER BY received_at DESC LIMIT 365`,
+      [user.id]
+    );
+    const history = snapRows.map(r => r.data);
+    const latest = history[0] || null;
+
+    res.json({ user: { id: user.id, username: user.username, display_name: user.display_name, avatar_url: user.avatar_url }, latest, history, groups: [] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
