@@ -183,7 +183,7 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "OPTIONS"],
   allowedHeaders: ["Content-Type", "x-api-secret", "Authorization"],
 }));
-app.use(express.json({ limit: "4mb" }));
+app.use(express.json({ limit: "25mb" }));   // CSV exports are sent as JSON text
 
 // ── Auth
 function auth(req, res, next) {
@@ -391,6 +391,169 @@ app.post("/ask", auth, async (req, res) => {
     send({ type: "error", text: msg });
   }
   res.end();
+});
+
+// ─────────────────────────────────────────────────────────────────
+// AUTOMATIONS — file imports (Fitbod + any CSV via AI column mapping),
+// data-source monitor, and export reminders
+// ─────────────────────────────────────────────────────────────────
+const { parseCSVText, isFitbodCSV, fitbodSnapshots } = require("./importers/fitbod");
+const { z } = require("zod");
+const { zodOutputFormat } = require("@anthropic-ai/sdk/helpers/zod");
+
+const slug = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+const MAPPABLE_KEYS = "weight, bodyFat, leanMass, muscleMass, fatMass, bmi, visceralFat, boneMass, bmr, rmr, metabolicAge, waistIn, chestIn, hipsIn, neckIn, shouldersIn, rightBicepIn, leftBicepIn, rightThighIn, leftThighIn, steps, calsBurned, activeMins, avgHR, restingHR, hrv, vo2max, sleepScore, sleepDur (hours), deepSleep, remSleep, lightSleep, readiness, spo2, respiratoryRate, calories, protein, carbs, fat, fiber, sugar, sodium, water (L), workoutVol, workoutDur (min)";
+
+function isoDay(v) {
+  const t = String(v || "").trim(); if (!t) return null;
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  const us = t.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/);
+  if (us) { const y = us[3].length === 2 ? "20" + us[3] : us[3]; return `${y}-${us[1].padStart(2, "0")}-${us[2].padStart(2, "0")}`; }
+  const d = new Date(t); return isNaN(d) ? null : d.toISOString().slice(0, 10);
+}
+
+const CsvMapping = z.object({
+  source: z.string().describe("App or device the file came from, e.g. 'Oura', 'Withings', 'Strong'"),
+  dateColumn: z.string().describe("Header of the column holding the date or timestamp"),
+  columns: z.array(z.object({
+    header: z.string(),
+    action: z.enum(["metric", "custom", "ignore"]),
+    key: z.string().describe("For action=metric: one of the BioTrack keys. Otherwise empty."),
+    label: z.string().describe("For action=custom: short human label. Otherwise empty."),
+    unit: z.string().describe("Unit after conversion, e.g. lbs, %, kcal, min, bpm. Empty if none."),
+    multiply: z.number().describe("Factor to convert the raw value to the unit (e.g. kg→lbs 2.20462, seconds→hours 0.000277778, fraction→% 100). 1 if none."),
+    aggregate: z.enum(["sum", "avg", "last"]).describe("How to combine several rows on the same day"),
+  })),
+});
+
+async function aiMapCSV(headers, sample, filename) {
+  const { anthropicKey } = await getCoachingSettings();
+  if (!anthropicKey) throw new Error("This file format is new to BioTrack, and mapping it needs an Anthropic API key (AI Coach settings).");
+  const client = new AnthropicClient({ apiKey: anthropicKey });
+  const response = await client.messages.parse({
+    model: ASK_MODEL,
+    max_tokens: 16000,
+    output_config: { effort: "low", format: zodOutputFormat(CsvMapping) },
+    messages: [{ role: "user", content:
+      `Map this health/fitness export into BioTrack daily metrics.\nFile: ${filename}\nHeaders: ${JSON.stringify(headers)}\nFirst rows:\n${sample.map(r => JSON.stringify(r)).join("\n")}\n\n` +
+      `Use action=metric with one of these BioTrack keys when a column clearly matches (convert units with multiply): ${MAPPABLE_KEYS}.\n` +
+      `Use action=custom for any other useful numeric health/fitness column. Use action=ignore for ids, text, notes, and the date column itself.` }],
+  });
+  if (!response.parsed_output) throw new Error("AI couldn't map this file's columns.");
+  return response.parsed_output;
+}
+
+function applyMapping(records, map) {
+  const byDay = {};
+  for (const r of records) {
+    const date = isoDay(r[map.dateColumn]); if (!date) continue;
+    const day = byDay[date] || (byDay[date] = {});
+    for (const c of map.columns) {
+      if (c.action === "ignore") continue;
+      const raw = parseFloat(String(r[c.header] ?? "").replace(/[^0-9.\-]/g, ""));
+      if (!isFinite(raw)) continue;
+      const v = raw * (c.multiply || 1);
+      const key = c.action === "metric" ? c.key : "c_" + slug(c.label || c.header);
+      const a = day[key] || (day[key] = { sum: 0, n: 0, last: v, agg: c.aggregate });
+      a.sum += v; a.n++; a.last = v;
+    }
+  }
+  const defs = {};
+  for (const c of map.columns) if (c.action === "custom") defs["c_" + slug(c.label || c.header)] = { l: c.label || c.header, u: c.unit || "" };
+  return Object.keys(byDay).sort().map(date => {
+    const snap = { syncDate: date, source: map.source + " export" };
+    for (const [k, a] of Object.entries(byDay[date])) snap[k] = Math.round((a.agg === "sum" ? a.sum : a.agg === "last" ? a.last : a.sum / a.n) * 100) / 100;
+    if (Object.keys(defs).length) snap.customDefs = defs;
+    return { date, snapshot: snap };
+  });
+}
+
+// POST /import/file  { filename, text, all?: bool }
+app.post("/import/file", auth, async (req, res) => {
+  try {
+    const { filename = "upload.csv", text, all } = req.body || {};
+    if (typeof text !== "string" || !text.trim()) return res.status(400).json({ error: "Empty file" });
+    const { headers, records } = parseCSVText(text);
+    if (!headers.length || !records.length) return res.status(400).json({ error: "Couldn't read any rows. Send a CSV export." });
+
+    let source, days;
+    if (isFitbodCSV(headers)) { source = "Fitbod"; days = fitbodSnapshots(records); }
+    else {
+      const meta = await dbGetMeta();
+      const sig = slug(headers.join("|")).slice(0, 180);
+      let map = meta["import_map_" + sig];
+      if (!map) { map = await aiMapCSV(headers, records.slice(0, 5), filename); await dbSetMeta({ ["import_map_" + sig]: map }); }
+      source = map.source; days = applyMapping(records, map);
+    }
+    const key = "import_" + slug(source);
+    const meta = await dbGetMeta();
+    // Re-exports contain the whole history: only re-send the last 3 days already imported, plus anything newer
+    const prevNewest = meta[key + "_newest"] || (source === "Fitbod" ? meta.fitbod_newest_date : null);   // older script stored it here
+    const cutoff = !all && prevNewest ? new Date(new Date(prevNewest).getTime() - 3 * 864e5).toISOString().slice(0, 10) : "";
+    const fresh = days.filter(d => d.date >= cutoff);
+    const now = new Date().toISOString();
+    for (const d of fresh) await dbInsertSnapshot({ ...d.snapshot, _receivedAt: now, _id: crypto.randomUUID() });
+    _daysCache = { at: 0, days: null };
+    const newest = days.length ? days[days.length - 1].date : meta[key + "_newest"];
+    await dbSetMeta({ [key + "_last"]: now, [key + "_newest"]: newest, [key + "_days"]: days.length, [key + "_name"]: source });
+    console.log(`[import] ${source}: ${fresh.length} of ${days.length} days stored (newest ${newest})`);
+    res.json({ ok: true, source, daysInFile: days.length, imported: fresh.length, newest, first: days[0]?.date });
+  } catch (e) {
+    console.error("/import/file error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /sources — every app feeding BioTrack, how, and how fresh
+const DETAIL_GAPS = { fitbod: "Apple Health gets each session (time, calories, heart rate). Sets, reps and weights only come from Fitbod's CSV export." };
+app.get("/sources", auth, async (req, res) => {
+  try {
+    const days = await loadDays(); const meta = await dbGetMeta();
+    const apps = {};
+    for (const d of days) {
+      if (!d.hkSources) continue;
+      for (const [k, list] of Object.entries(d.hkSources)) for (const name of list) {
+        const a = apps[name] || (apps[name] = { name, via: "Apple Health", first: d._dateKey, last: d._dateKey, metrics: new Set() });
+        a.last = d._dateKey > a.last ? d._dateKey : a.last; a.metrics.add(k);
+      }
+    }
+    const out = Object.values(apps).map(a => ({ ...a, metrics: a.metrics.size, mode: "automatic", note: DETAIL_GAPS[slug(a.name)] || null }));
+    for (const k of Object.keys(meta)) {
+      const m = k.match(/^import_(.+)_last$/); if (!m || m[1].startsWith("map_")) continue;
+      out.push({ name: (meta[`import_${m[1]}_name`] || m[1]) + " export", via: "File import", last: meta[`import_${m[1]}_newest`], lastImport: meta[k], days: meta[`import_${m[1]}_days`], mode: "manual" });
+    }
+    if (meta.fitbod_last_import && !out.some(o => /fitbod export/i.test(o.name)))
+      out.push({ name: "Fitbod export", via: "File import", last: meta.fitbod_newest_date, lastImport: meta.fitbod_last_import, days: meta.fitbod_days_imported, mode: "manual" });
+    const today = new Date().toISOString().slice(0, 10);
+    for (const o of out) o.daysSince = o.last ? Math.round((new Date(today) - new Date(o.last)) / 864e5) : null;
+    out.sort((a, b) => (a.mode === b.mode ? 0 : a.mode === "manual" ? -1 : 1) || (b.daysSince ?? 0) - (a.daysSince ?? 0));
+    res.json({ sources: out, lastPhoneSync: days.filter(d => d.hkMeta).slice(-1)[0]?._dateKey || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET/POST /automations — export reminders the phone schedules as notifications
+app.get("/automations", auth, async (req, res) => {
+  try { const meta = await dbGetMeta(); res.json({ reminders: meta.automation_reminders || [] }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/automations", auth, async (req, res) => {
+  try {
+    const list = Array.isArray(req.body?.reminders) ? req.body.reminders : null;
+    if (!list) return res.status(400).json({ error: "reminders must be an array" });
+    const clean = list.slice(0, 20).map(r => ({
+      id: String(r.id || crypto.randomUUID()).slice(0, 40),
+      app: String(r.app || "").slice(0, 40),
+      title: String(r.title || "").slice(0, 80),
+      openURL: /^[a-z][a-z0-9+.-]*:/i.test(r.openURL || "") ? String(r.openURL).slice(0, 200) : "",
+      frequency: r.frequency === "daily" ? "daily" : "weekly",
+      weekday: Math.min(7, Math.max(1, parseInt(r.weekday) || 1)),   // 1 = Sunday (iOS calendar)
+      hour: Math.min(23, Math.max(0, parseInt(r.hour) || 0)),
+      minute: Math.min(59, Math.max(0, parseInt(r.minute) || 0)),
+      enabled: r.enabled !== false,
+    }));
+    await dbSetMeta({ automation_reminders: clean });
+    res.json({ ok: true, reminders: clean });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /latest
