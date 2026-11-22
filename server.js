@@ -359,10 +359,12 @@ app.post("/ask", auth, async (req, res) => {
       });
       stream.on("text", (t) => { if (!closed) send({ type: "text", text: t }); });
       const msg = await stream.finalMessage();
+      console.log(`[ask] turn ${turn}: stop=${msg.stop_reason} model=${msg.model} blocks=${msg.content.map(b => b.type).join(",")}`);
       messages.push({ role: "assistant", content: msg.content });
 
       if (msg.stop_reason === "refusal") { send({ type: "text", text: "\n\n_I can't help with that one._" }); break; }
       if (msg.stop_reason === "pause_turn") continue;           // server tool (web search) still running
+      if (msg.stop_reason === "max_tokens") { send({ type: "text", text: "\n\n_(Answer cut off — ask me to continue.)_" }); break; }
       if (msg.stop_reason !== "tool_use") break;
 
       const results = [];
