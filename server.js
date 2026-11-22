@@ -531,6 +531,28 @@ app.get("/sources", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /export — full backup of every table (auth). Streams JSON so large tables don't buffer in memory.
+app.get("/export", auth, async (req, res) => {
+  try {
+    const { rows: tables } = await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY 1`);
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Content-Disposition", `attachment; filename="bodydata-export-${new Date().toISOString().slice(0,10)}.json"`);
+    res.write(`{"exportedAt":${JSON.stringify(new Date().toISOString())},"tables":{`);
+    for (let t = 0; t < tables.length; t++) {
+      const name = tables[t].table_name;
+      res.write(`${t ? "," : ""}${JSON.stringify(name)}:[`);
+      let offset = 0, first = true;
+      for (;;) {
+        const { rows } = await pool.query(`SELECT * FROM "${name.replace(/"/g, "")}" ORDER BY 1 LIMIT 2000 OFFSET $1`, [offset]);
+        for (const r of rows) { res.write((first ? "" : ",") + JSON.stringify(r)); first = false; }
+        if (rows.length < 2000) break; offset += 2000;
+      }
+      res.write("]");
+    }
+    res.end("}}");
+  } catch (e) { console.error("/export error:", e.message); if (!res.headersSent) res.status(500).json({ error: e.message }); else res.end(); }
+});
+
 // GET/POST /prefs — dashboard layout (card order + hidden KPIs), shared by every device
 app.get("/prefs", auth, async (req, res) => {
   try { const meta = await dbGetMeta(); res.json(meta.dashboard_prefs || {}); }
