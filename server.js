@@ -271,10 +271,21 @@ app.get("/stats", auth, async (req, res) => {
   }
 });
 
+// Never send stored credentials back over the wire — only whether they are set.
+const SENSITIVE_META = /(key|pass|secret|token)/i;
+function publicMeta(m) {
+  const out = {};
+  for (const [k, v] of Object.entries(m || {})) {
+    if (SENSITIVE_META.test(k)) out[k + "_set"] = !!v;
+    else out[k] = v;
+  }
+  return out;
+}
+
 // GET /meta
 app.get("/meta", auth, async (req, res) => {
   try {
-    res.json(await dbGetMeta());
+    res.json(publicMeta(await dbGetMeta()));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -290,7 +301,7 @@ app.post("/meta", auth, async (req, res) => {
     await dbSetMeta(updates);
     const meta = await dbGetMeta();
     console.log(`[meta] updated:`, Object.keys(updates).join(", "));
-    res.json({ ok: true, meta });
+    res.json({ ok: true, meta: publicMeta(meta) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -665,7 +676,7 @@ app.get("/coaching/settings", auth, async (req, res) => {
     const s = await getCoachingSettings();
     res.json({
       anthropicKeySet: !!s.anthropicKey,
-      anthropicKeyHint: s.anthropicKey ? s.anthropicKey.slice(0,12)+"..." : null,
+      anthropicKeyHint: s.anthropicKey ? "sk-ant-…" + s.anthropicKey.slice(-4) : null,
       email:        s.email      || null,
       resendKeySet: !!s.resendKey,
       gmailUser:    s.gmailUser  || null,
@@ -979,7 +990,7 @@ dbInit()
     app.listen(PORT, () => {
       console.log(`\n⬡ BioTrack API v2.2 — port ${PORT}`);
       console.log(`  Storage: PostgreSQL`);
-      console.log(`  SECRET_KEY: ${SECRET.slice(0,4)}${"*".repeat(Math.max(0, SECRET.length-4))}`);
+      console.log(`  SECRET_KEY: set (${SECRET.length} chars)`);
       console.log(`  CORS: ${ALLOWED.join(", ") || "all"}`);
 
       // ── 3 daily coaching sessions — schedule read from DB so /coaching/settings changes take effect on redeploy
