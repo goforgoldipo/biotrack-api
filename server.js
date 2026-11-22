@@ -531,6 +531,25 @@ app.get("/sources", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET/POST /prefs — dashboard layout (card order + hidden KPIs), shared by every device
+app.get("/prefs", auth, async (req, res) => {
+  try { const meta = await dbGetMeta(); res.json(meta.dashboard_prefs || {}); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/prefs", auth, async (req, res) => {
+  try {
+    const { kpiOrder, kpiHidden } = req.body || {};
+    const order = {};
+    if (kpiOrder && typeof kpiOrder === "object" && !Array.isArray(kpiOrder))
+      for (const [g, ids] of Object.entries(kpiOrder).slice(0, 60))
+        if (Array.isArray(ids)) order[String(g).slice(0, 60)] = ids.slice(0, 400).map(x => String(x).slice(0, 120));
+    const hidden = Array.isArray(kpiHidden) ? kpiHidden.slice(0, 1000).map(x => String(x).slice(0, 120)) : [];
+    const prefs = { kpiOrder: order, kpiHidden: hidden, updatedAt: new Date().toISOString() };
+    await dbSetMeta({ dashboard_prefs: prefs });
+    res.json({ ok: true, ...prefs });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET/POST /automations — export reminders the phone schedules as notifications
 app.get("/automations", auth, async (req, res) => {
   try { const meta = await dbGetMeta(); res.json({ reminders: meta.automation_reminders || [] }); }
