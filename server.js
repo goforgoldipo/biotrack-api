@@ -106,7 +106,7 @@ async function dbSetMeta(updates) {
 }
 
 // Dedup history by date (same logic as before — merge fields across same-day syncs)
-function dedupHistory(rawSnaps, days) {
+function dedupHistory(rawSnaps, days, keepDateKey = false) {
   const withDates = rawSnaps.map(snap => {
     let dateKey = "unknown";
     if (snap.syncDate) {
@@ -160,7 +160,7 @@ function dedupHistory(rawSnaps, days) {
   return Object.values(byDate)
     .sort((a, b) => (b._dateKey || "").localeCompare(a._dateKey || ""))
     .slice(0, days)
-    .map(({ _dateKey, ...rest }) => rest);
+    .map(({ _dateKey, ...rest }) => keepDateKey ? { ...rest, _dateKey } : rest);
 }
 
 // ── CORS
@@ -217,6 +217,177 @@ app.post("/sync", auth, async (req, res) => {
     console.error("/sync error:", e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// ASK AI — chat with Claude about the user's full health history
+// The model gets a catalog of every metric + a tool to pull any metric over any range,
+// so 10+ years of data never has to be pasted into the prompt.
+// ─────────────────────────────────────────────────────────────────
+const Anthropic = require("@anthropic-ai/sdk");
+const AnthropicClient = Anthropic.default || Anthropic;
+const ASK_MODEL = "claude-opus-5-5";
+
+let _daysCache = { at: 0, days: null };
+async function loadDays() {
+  if (_daysCache.days && Date.now() - _daysCache.at < 5 * 60 * 1000) return _daysCache.days;
+  const days = dedupHistory(await dbGetHistory(20000), 20000, true)
+    .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d._dateKey))
+    .sort((a, b) => a._dateKey.localeCompare(b._dateKey));
+  _daysCache = { at: Date.now(), days };
+  return days;
+}
+
+function metricCatalog(days) {
+  const cat = {};
+  for (const d of days) {
+    for (const [k, v] of Object.entries(d)) {
+      if (typeof v !== "number" || !isFinite(v) || k.startsWith("_")) continue;
+      const c = cat[k] || (cat[k] = { first: d._dateKey, last: d._dateKey, n: 0 });
+      c.last = d._dateKey; c.n++;
+    }
+    if (d.hkMeta) for (const [k, m] of Object.entries(d.hkMeta)) if (cat[k]) { cat[k].unit = m[0]; if (m[2]) cat[k].label = m[2]; }
+    // Apple Health reports percentages as fractions (0.18) — store as 18 like the rest of BioTrack
+    if (d.hkMeta) for (const [k, m] of Object.entries(d.hkMeta)) if (m[0] === "%" && typeof d[k] === "number" && Math.abs(d[k]) <= 1.5) d[k] = Math.round(d[k] * 10000) / 100;
+  }
+  return cat;
+}
+
+function bucketKey(date, g) {
+  if (g === "day") return date;
+  if (g === "month") return date.slice(0, 7);
+  if (g === "year") return date.slice(0, 4);
+  const d = new Date(date + "T12:00:00Z"); const dow = (d.getUTCDay() + 6) % 7; d.setUTCDate(d.getUTCDate() - dow);
+  return "wk " + d.toISOString().slice(0, 10);
+}
+
+function queryMetrics(days, { metrics = [], start, end, granularity = "day" }) {
+  const g = ["day", "week", "month", "year"].includes(granularity) ? granularity : "day";
+  const rows = days.filter(d => (!start || d._dateKey >= start) && (!end || d._dateKey <= end));
+  const out = {};
+  for (const m of metrics.slice(0, 25)) {
+    const b = new Map();
+    for (const d of rows) {
+      const v = d[m]; if (typeof v !== "number" || !isFinite(v)) continue;
+      const k = bucketKey(d._dateKey, g); const x = b.get(k) || { sum: 0, n: 0, min: v, max: v };
+      x.sum += v; x.n++; x.min = Math.min(x.min, v); x.max = Math.max(x.max, v); b.set(k, x);
+    }
+    const r = (v) => Math.round(v * 100) / 100;
+    out[m] = g === "day"
+      ? [...b].map(([k, x]) => [k, r(x.sum)])
+      : [...b].map(([k, x]) => ({ period: k, avg: r(x.sum / x.n), min: r(x.min), max: r(x.max), total: r(x.sum), days: x.n }));
+    if (g === "day" && out[m].length > 400) out[m] = { note: "Too many daily points — use week or month granularity for this range.", points: out[m].length };
+  }
+  return { start: start || rows[0]?._dateKey, end: end || rows[rows.length - 1]?._dateKey, granularity: g, data: out };
+}
+
+const ASK_TOOLS = [
+  {
+    name: "get_health_data",
+    description: "Fetch the user's recorded values for one or more metrics over a date range. Daily granularity returns [date, value] pairs; week/month/year return avg, min, max, total and days logged per period. Use month or year for multi-year questions, then zoom in. Metric keys must come from the catalog in the system prompt.",
+    input_schema: {
+      type: "object",
+      properties: {
+        metrics: { type: "array", items: { type: "string" }, description: "Metric keys from the catalog (max 25)" },
+        start: { type: "string", description: "YYYY-MM-DD inclusive" },
+        end: { type: "string", description: "YYYY-MM-DD inclusive" },
+        granularity: { type: "string", enum: ["day", "week", "month", "year"] },
+      },
+      required: ["metrics", "granularity"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+  { type: "web_search_20260209", name: "web_search", max_uses: 4 },
+];
+
+function askSystemPrompt(days, cat) {
+  const today = new Date().toISOString().slice(0, 10);
+  const last = days.slice(-1)[0] || {};
+  const catalog = Object.entries(cat).sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, c]) => `${k}${c.label ? ` ("${c.label}")` : ""}${c.unit ? ` [${c.unit}]` : ""}: ${c.first} → ${c.last}, ${c.n} days`).join("\n");
+  return `You are BioTrack's health and performance coach. The user is asking about their own health data, collected from Apple Health (every app and device on their iPhone: Apple Watch, Hume scale, Fitbod, MyFitnessPal, Oura and others), plus manual uploads. Their goal is to get in the best shape of their life: lower body fat, more lean muscle, better recovery and longevity.
+
+How to answer:
+- Ground every claim in their actual numbers. Use get_health_data to look before you answer; pull the ranges you need, compare periods, and spot trends, correlations and outliers. Quote specific values and dates.
+- Give the best possible answer, like a world-class coach and sports physician reviewing their data: what's happening, why it likely matters, and exactly what to do next (concrete targets, numbers, and timeframes).
+- Use web_search when current research or guidelines would improve the answer, and cite sources briefly.
+- Be direct and specific. Lead with the answer, then the evidence. Use short sections or bullets and markdown tables for comparisons. Skip generic disclaimers; if something warrants a doctor, say so plainly in one line.
+- If data needed for a question isn't tracked, say which metric is missing and how to start tracking it.
+
+Today is ${today}. Data covers ${days[0]?._dateKey || "?"} to ${last._dateKey || "?"} (${days.length} days).
+
+Metric catalog (key ("label") [unit]: first → last date, days with data). hk_* are Apple Health quantities, hkc_* Apple Health categories (minutes or counts), hkw_* workouts; the rest are BioTrack's named fields (weight lbs, bodyFat %, steps, calories, protein g, hrv ms, restingHR bpm, sleep, Fitbod training volume, body measurements in inches, custom metrics c_*):
+${catalog}`;
+}
+
+// POST /ask  { messages: [{role:"user"|"assistant", content:string}, ...] }  → text/event-stream
+app.post("/ask", auth, async (req, res) => {
+  const history = Array.isArray(req.body?.messages) ? req.body.messages : [];
+  const messages = history
+    .filter(m => (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
+    .slice(-20)
+    .map(m => ({ role: m.role, content: m.content }));
+  if (!messages.length || messages[messages.length - 1].role !== "user") return res.status(400).json({ error: "Send a question" });
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+  let closed = false; req.on("close", () => { closed = true; });
+
+  try {
+    const { anthropicKey } = await getCoachingSettings();
+    if (!anthropicKey) { send({ type: "error", text: "No Anthropic API key is set. Add one in AI Coach settings." }); return res.end(); }
+    const client = new AnthropicClient({ apiKey: anthropicKey });
+    const days = await loadDays();
+    const cat = metricCatalog(days);
+    const system = [{ type: "text", text: askSystemPrompt(days, cat), cache_control: { type: "ephemeral" } }];
+
+    for (let turn = 0; turn < 12 && !closed; turn++) {
+      const stream = client.beta.messages.stream({
+        model: ASK_MODEL,
+        max_tokens: 32000,
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default",
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "high" },
+        system,
+        tools: ASK_TOOLS,
+        messages,
+      });
+      stream.on("text", (t) => { if (!closed) send({ type: "text", text: t }); });
+      const msg = await stream.finalMessage();
+      messages.push({ role: "assistant", content: msg.content });
+
+      if (msg.stop_reason === "refusal") { send({ type: "text", text: "\n\n_I can't help with that one._" }); break; }
+      if (msg.stop_reason === "pause_turn") continue;           // server tool (web search) still running
+      if (msg.stop_reason !== "tool_use") break;
+
+      const results = [];
+      for (const b of msg.content) {
+        if (b.type !== "tool_use" || b.name !== "get_health_data") continue;
+        const input = b.input || {};
+        send({ type: "status", text: `Looking at ${(input.metrics || []).slice(0, 4).join(", ")}${(input.metrics || []).length > 4 ? "…" : ""} (${input.granularity}${input.start ? `, ${input.start} → ${input.end || "today"}` : ""})` });
+        try {
+          results.push({ type: "tool_result", tool_use_id: b.id, content: JSON.stringify(queryMetrics(days, input)) });
+        } catch (e) {
+          results.push({ type: "tool_result", tool_use_id: b.id, content: "Error: " + e.message, is_error: true });
+        }
+      }
+      if (!results.length) break;
+      messages.push({ role: "user", content: results });
+    }
+    send({ type: "done" });
+  } catch (e) {
+    const msg = e instanceof AnthropicClient.AuthenticationError ? "The saved Anthropic API key was rejected. Paste a new one in AI Coach settings."
+      : e instanceof AnthropicClient.RateLimitError ? "Rate limited by Anthropic. Try again in a minute."
+      : e instanceof AnthropicClient.APIError ? `AI error ${e.status}: ${e.message}` : e.message;
+    console.error("/ask error:", e.message);
+    send({ type: "error", text: msg });
+  }
+  res.end();
 });
 
 // GET /latest
