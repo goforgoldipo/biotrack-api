@@ -314,6 +314,7 @@ How to answer:
 - Use web_search when current research or guidelines would improve the answer, and cite sources briefly.
 - Be direct and specific. Lead with the answer, then the evidence. Use short sections or bullets and markdown tables for comparisons. Skip generic disclaimers; if something warrants a doctor, say so plainly in one line.
 - If data needed for a question isn't tracked, say which metric is missing and how to start tracking it.
+- Workouts: hkw_src_<app>_count / _minutes are workout sessions per app from Apple Health and are current (e.g. hkw_src_fitbod_* = Fitbod sessions). The fitbod*/workoutVol/vol*/sets*/reps*/max* fields (sets, reps, weights, volume per muscle) only come from a manual Fitbod CSV export, so they stop at the last export date: never conclude the user stopped training from those alone; check hkw_* and hk_activeEnergyBurned first, and mention when the detailed export is stale.
 
 Today is ${today}. Data covers ${days[0]?._dateKey || "?"} to ${last._dateKey || "?"} (${days.length} days).
 
