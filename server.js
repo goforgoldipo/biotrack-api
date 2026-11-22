@@ -335,7 +335,7 @@ app.post("/ask", auth, async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders?.();
   const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
-  let closed = false; req.on("close", () => { closed = true; });
+  let closed = false; res.on("close", () => { closed = true; });   // res, not req: req "close" fires once the body is read
 
   try {
     const { anthropicKey } = await getCoachingSettings();
