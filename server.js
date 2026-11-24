@@ -21,8 +21,13 @@ const SECRET = process.env.SECRET_KEY || (() => { throw new Error("SECRET_KEY en
 // ── PostgreSQL connection pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  ssl: process.env.DATABASE_URL && !/@(localhost|127\.0\.0\.1)[:/]/.test(process.env.DATABASE_URL) ? { rejectUnauthorized: false } : false,
 });
+
+// ── Accounts: every request runs as one user (tenancy.js)
+const Tenancy = require("./tenancy");
+const { OWNER, currentUser, runAs } = Tenancy;
+let T;   // set once SECRET is known (below)
 
 // ── Create tables on startup (idempotent)
 async function dbInit() {
@@ -51,9 +56,8 @@ async function dbInit() {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
 
-    ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS user_id TEXT REFERENCES users(id);
-    CREATE INDEX IF NOT EXISTS idx_snap_user ON snapshots (user_id, received_at DESC);
   `);
+  await T.migrate();   // users/owner, per-user snapshots + meta, API keys
   console.log("  ✓ DB tables ready");
 }
 
@@ -63,14 +67,14 @@ async function dbInit() {
 
 async function dbInsertSnapshot(snap) {
   await pool.query(
-    `INSERT INTO snapshots (received_at, sync_date, data) VALUES ($1, $2, $3)`,
-    [snap._receivedAt, snap.syncDate || null, JSON.stringify(snap)]
+    `INSERT INTO snapshots (received_at, sync_date, data, user_id) VALUES ($1, $2, $3, $4)`,
+    [snap._receivedAt, snap.syncDate || null, JSON.stringify(snap), currentUser()]
   );
 }
 
 async function dbGetLatest() {
   const { rows } = await pool.query(
-    `SELECT data FROM snapshots ORDER BY received_at DESC LIMIT 1`
+    `SELECT data FROM snapshots WHERE user_id = $1 ORDER BY received_at DESC LIMIT 1`, [currentUser()]
   );
   return rows[0]?.data || null;
 }
@@ -80,14 +84,14 @@ async function dbGetHistory(days) {
   // Fetch up to days*15 raw rows — plenty of buffer to dedup into `days` unique dates
   const limit = Math.min(days * 15, 50000);
   const { rows } = await pool.query(
-    `SELECT data FROM snapshots ORDER BY received_at DESC LIMIT $1`,
-    [limit]
+    `SELECT data FROM snapshots WHERE user_id = $2 ORDER BY received_at DESC LIMIT $1`,
+    [limit, currentUser()]
   );
   return rows.map(r => r.data);
 }
 
-async function dbGetMeta() {
-  const { rows } = await pool.query(`SELECT key, value FROM meta`);
+async function dbGetMeta(uid = currentUser()) {
+  const { rows } = await pool.query(`SELECT key, value FROM meta WHERE user_id = $1`, [uid]);
   const out = {};
   rows.forEach(r => {
     try { out[r.key] = JSON.parse(r.value); } catch { out[r.key] = r.value; }
@@ -95,12 +99,12 @@ async function dbGetMeta() {
   return out;
 }
 
-async function dbSetMeta(updates) {
+async function dbSetMeta(updates, uid = currentUser()) {
   for (const [key, value] of Object.entries(updates)) {
     await pool.query(
-      `INSERT INTO meta (key, value) VALUES ($1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-      [key, JSON.stringify(value)]
+      `INSERT INTO meta (user_id, key, value) VALUES ($3, $1, $2)
+       ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, JSON.stringify(value), uid]
     );
   }
 }
@@ -186,13 +190,9 @@ app.use(cors({
 app.use(express.json({ limit: "25mb" }));   // CSV exports are sent as JSON text
 
 // ── Auth
-function auth(req, res, next) {
-  const key = req.headers["x-api-secret"];
-  if (!key || key !== SECRET) {
-    return res.status(401).json({ error: "Unauthorized — wrong or missing x-api-secret header" });
-  }
-  next();
-}
+T = Tenancy({ pool, SECRET });
+function auth(req, res, next) { return T.auth(req, res, next); }   // Clerk session, per-user key, or the owner's SECRET
+T.routes(app);
 
 // ─────────────────────────────────────────────────────────────────
 // ROUTES
@@ -227,14 +227,26 @@ app.post("/sync", auth, async (req, res) => {
 const Anthropic = require("@anthropic-ai/sdk");
 const AnthropicClient = Anthropic.default || Anthropic;
 const ASK_MODEL = "claude-opus-5-5";
+const Usage = require("./usage")({ pool, AnthropicClient,   // per-user AI cost, free monthly allowance + credits
+  notify: async (title, body) => { const c = await runAs(OWNER, () => getCoachingSettings()); await sendPushNotification(title, body, c.ntfyTopic); } });
+Usage.routes(app, auth);
+const Jobs = require("./jobs")({ pool });   // long AI work (PDF reading) outside the request
+Jobs.routes(app, auth);
 
-let _daysCache = { at: 0, days: null };
+// Per-user day cache, refreshed the moment that user's data changes
+const _dayCaches = new Map();
+const _daysCacheReset = () => _dayCaches.delete(currentUser());
 async function loadDays() {
-  if (_daysCache.days && Date.now() - _daysCache.at < 5 * 60 * 1000) return _daysCache.days;
+  const uid = currentUser();
+  const { rows: m } = await pool.query(`SELECT MAX(received_at) AS t, COUNT(*) AS n FROM snapshots WHERE user_id = $1`, [uid]);
+  const stamp = `${m[0]?.t?.toISOString?.() || ""}|${m[0]?.n}`;
+  const c = _dayCaches.get(uid);
+  if (c?.days && c.stamp === stamp) return c.days;
   const days = dedupHistory(await dbGetHistory(20000), 20000, true)
     .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d._dateKey))
     .sort((a, b) => a._dateKey.localeCompare(b._dateKey));
-  _daysCache = { at: Date.now(), days };
+  if (_dayCaches.size > 200) _dayCaches.delete(_dayCaches.keys().next().value);
+  _dayCaches.set(uid, { stamp, days });
   return days;
 }
 
@@ -247,8 +259,8 @@ function metricCatalog(days) {
       c.last = d._dateKey; c.n++;
     }
     if (d.hkMeta) for (const [k, m] of Object.entries(d.hkMeta)) if (cat[k]) { cat[k].unit = m[0]; if (m[2]) cat[k].label = m[2]; }
-    // Apple Health reports percentages as fractions (0.18) — store as 18 like the rest of BioTrack
-    if (d.hkMeta) for (const [k, m] of Object.entries(d.hkMeta)) if (m[0] === "%" && typeof d[k] === "number" && Math.abs(d[k]) <= 1.5) d[k] = Math.round(d[k] * 10000) / 100;
+    // hk_* "%" values arrive already as percents (the iPhone app converts 0.18 → 18), so no rescaling here.
+    // A "≤ 1.5 means fraction" guess used to turn real sub-1.5 % walking asymmetry into 50–70 %.
   }
   return cat;
 }
@@ -306,7 +318,7 @@ function askSystemPrompt(days, cat) {
   const last = days.slice(-1)[0] || {};
   const catalog = Object.entries(cat).sort(([a], [b]) => a.localeCompare(b))
     .map(([k, c]) => `${k}${c.label ? ` ("${c.label}")` : ""}${c.unit ? ` [${c.unit}]` : ""}: ${c.first} → ${c.last}, ${c.n} days`).join("\n");
-  return `You are BioTrack's health and performance coach. The user is asking about their own health data, collected from Apple Health (every app and device on their iPhone: Apple Watch, Hume scale, Fitbod, MyFitnessPal, Oura and others), plus manual uploads. Their goal is to get in the best shape of their life: lower body fat, more lean muscle, better recovery and longevity.
+  return `You are BodyData's health and performance coach. The user is asking about their own health data, collected from Apple Health (every app and device on their iPhone: Apple Watch, Hume scale, Fitbod, MyFitnessPal, Oura and others), plus manual uploads. Their goal is to get in the best shape of their life: lower body fat, more lean muscle, better recovery and longevity.
 
 How to answer:
 - Ground every claim in their actual numbers. Use get_health_data to look before you answer; pull the ranges you need, compare periods, and spot trends, correlations and outliers. Quote specific values and dates.
@@ -318,9 +330,62 @@ How to answer:
 
 Today is ${today}. Data covers ${days[0]?._dateKey || "?"} to ${last._dateKey || "?"} (${days.length} days).
 
-Metric catalog (key ("label") [unit]: first → last date, days with data). hk_* are Apple Health quantities, hkc_* Apple Health categories (minutes or counts), hkw_* workouts; the rest are BioTrack's named fields (weight lbs, bodyFat %, steps, calories, protein g, hrv ms, restingHR bpm, sleep, Fitbod training volume, body measurements in inches, custom metrics c_*):
+Metric catalog (key ("label") [unit]: first → last date, days with data). hk_* are Apple Health quantities, hkc_* Apple Health categories (minutes or counts), hkw_* workouts; the rest are BodyData's named fields (weight lbs, bodyFat %, steps, calories, protein g, hrv ms, restingHR bpm, sleep, Fitbod training volume, body measurements in inches, custom metrics c_*):
 ${catalog}`;
 }
+
+// Custom KPI sections (AI-defined KPIs + API / MCP / agent / file sources)
+const { parseCSVText: _parseCSV } = require("./importers/fitbod");
+const _slug = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+const sections = require("./sections")(app, {
+  auth, dbGetMeta, dbSetMeta, dbInsertSnapshot, getCoachingSettings, AnthropicClient, model: ASK_MODEL,
+  parseCSVText: _parseCSV, slug: _slug, usage: () => Usage, isoDay: (v) => isoDay(v), invalidate: () => { _daysCacheReset(); },
+  loadDays, catalog: metricCatalog, pool, allUsers: () => T.allUsers(), jobs: () => Jobs,
+  // Fitbod CSVs keep using the dedicated importer (sets, reps, volume per muscle on the main board)
+  importKnownCsv: async (f) => {
+    const { headers, records } = parseCSVText(String(f.text || "")); if (!isFitbodCSV(headers)) return null;
+    const days = fitbodSnapshots(records), now = new Date().toISOString(), meta = await dbGetMeta();
+    const prev = meta.import_fitbod_newest || meta.fitbod_newest_date;   // re-exports hold the whole history: only resend the last 3 days + newer
+    const cutoff = prev ? new Date(new Date(prev).getTime() - 3 * 864e5).toISOString().slice(0, 10) : "";
+    for (const d of days.filter(x => x.date >= cutoff)) await dbInsertSnapshot({ ...d.snapshot, _receivedAt: now, _id: crypto.randomUUID() });
+    _daysCacheReset();
+    await dbSetMeta({ import_fitbod_last: now, import_fitbod_newest: days.length ? days[days.length - 1].date : null, import_fitbod_days: days.length, import_fitbod_name: "Fitbod", fitbod_last_import: now, fitbod_newest_date: days.length ? days[days.length - 1].date : null, fitbod_days_imported: days.length });
+    return { ok: true, name: "Fitbod workouts", existed: true, days: days.length, stored: days.length, newest: days[days.length - 1]?.date, kpis: 0, profile: "fitbod" };
+  },
+});
+
+// The agent as a builder: derived metrics, alerts, goals, with undo and approvals
+const Builder = require("./builder")(app, { auth, pool, dbGetMeta, dbSetMeta, loadDays, catalog: metricCatalog, S: sections,
+  invalidate: () => _daysCacheReset(), allUsers: () => T.allUsers(),
+  notify: async (title, body) => {   // the user's own push topic (the env topic is the owner's phone)
+    const m = await dbGetMeta(); const topic = m.coaching_ntfy_topic || (currentUser() === OWNER ? process.env.NTFY_TOPIC : null);
+    await sendPushNotification(title, body, topic);
+  } });
+
+// One-tap OAuth connections (Withings, WHOOP)
+const Connectors = require("./connectors")(app, { onSyncError: (uid, p, msg) => Ops?.alert(`connector:${p}`, `${p} sync failing`, `${uid}: ${msg}`), auth, dbGetMeta, dbSetMeta, S: sections, pool, SECRET, invalidate: () => _daysCacheReset(), allUsers: () => T.allUsers() });
+
+// Weekly review (Sunday evening): wins, watch-outs, 3 actions — grounded with the same data tool as Ask
+const aiDays = async () => { const b = await sections.noAiKeys(); const days = await loadDays(); return b.size ? days.map(d => { const o = {}; for (const k in d) if (!b.has(k)) o[k] = d[k]; return o; }) : days; };
+const Review = require("./review")(app, { auth, dbGetMeta, dbSetMeta, loadDays: aiDays, catalog: metricCatalog, systemPrompt: (d, c) => askSystemPrompt(d, c),
+  queryMetrics: (d, i) => queryMetrics(d, i), dataTool: ASK_TOOLS[0], Usage, model: ASK_MODEL, allUsers: () => T.allUsers(),
+  getKey: async () => (await getCoachingSettings()).anthropicKey,
+  extraPrompt: async () => (await Builder.promptBlock().catch(() => "")) + (await profileApi.promptBlock().catch(() => "")),
+  notify: async (title, body) => { const m = await dbGetMeta(); const topic = m.coaching_ntfy_topic || (currentUser() === OWNER ? process.env.NTFY_TOPIC : null); await sendPushNotification(title, body, topic); } });
+
+// Onboarding questionnaire answers + goal, per user
+const profileApi = require("./profile")(app, { auth, pool, dbGetMeta, loadDays, dedupHistory });
+// Terms/privacy consent (recorded per version) + permanent account deletion
+require("./legal")(app, { auth, pool });
+// Backups, owner alerts, invite-only sign-up
+const Ops = require("./ops")(app, { auth, pool,
+  notify: async (title, body) => { const c = await runAs(OWNER, () => getCoachingSettings()); await sendPushNotification(title, body, c.ntfyTopic); } });
+T.setAdmission(Ops.admit);
+// Feature requests + bug reports from both apps (push to the owner's ntfy topic when set)
+require("./feedback")(app, { auth, pool, userId: profileApi.userId,
+  notify: async (title, body) => { const c = await runAs(OWNER, () => getCoachingSettings()); await sendPushNotification(title, body.slice(0, 400), c.ntfyTopic); } });
+// Ready-made screens for the native iPhone app (same engine as the web dashboard)
+require("./app-api")(app, { auth, pool, dbGetMeta, dbGetHistory, dedupHistory, profileApi });
 
 // POST /ask  { messages: [{role:"user"|"assistant", content:string}, ...] }  → text/event-stream
 app.post("/ask", auth, async (req, res) => {
@@ -330,6 +395,17 @@ app.post("/ask", auth, async (req, res) => {
     .slice(-20)
     .map(m => ({ role: m.role, content: m.content }));
   if (!messages.length || messages[messages.length - 1].role !== "user") return res.status(400).json({ error: "Send a question" });
+  // Optional file on the latest message: PDF report, screenshot, or CSV text
+  const att = req.body?.attachment;
+  if (att && (att.data || att.text)) {
+    const last = messages[messages.length - 1];
+    const mt = att.mediaType || "";
+    const block = att.data && mt === "application/pdf" ? { type: "document", source: { type: "base64", media_type: mt, data: att.data }, title: String(att.filename || "report.pdf").slice(0, 200) }
+      : att.data && /^image\/(png|jpeg|webp|gif)$/.test(mt) ? { type: "image", source: { type: "base64", media_type: mt, data: att.data } }
+      : att.text ? { type: "text", text: `Attached file ${String(att.filename || "").slice(0, 200)}:\n${String(att.text).slice(0, 150000)}` } : null;
+    if (!block) return res.status(400).json({ error: "Attach a PDF, PNG, JPG, WebP or CSV." });
+    last.content = [block, { type: "text", text: last.content }];
+  }
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -340,11 +416,13 @@ app.post("/ask", auth, async (req, res) => {
 
   try {
     const { anthropicKey } = await getCoachingSettings();
-    if (!anthropicKey) { send({ type: "error", text: "No Anthropic API key is set. Add one in AI Coach settings." }); return res.end(); }
-    const client = new AnthropicClient({ apiKey: anthropicKey });
-    const days = await loadDays();
+    if (!anthropicKey) { send({ type: "error", text: "AI is temporarily unavailable. Please try again later." }); return res.end(); }
+    await Usage.checkBudget();
+    const client = Usage.client(anthropicKey, "ask");
+    const days = await aiDays();   // without data the user hasn't allowed AI to read (e.g. WHOOP)
     const cat = metricCatalog(days);
-    const system = [{ type: "text", text: askSystemPrompt(days, cat), cache_control: { type: "ephemeral" } }];
+    const system = [{ type: "text", text: askSystemPrompt(days, cat), cache_control: { type: "ephemeral" } }, { type: "text", text: (await sections.promptBlock()) + (await Builder.promptBlock().catch(() => "")) + (await profileApi.promptBlock().catch(() => "")) }];
+    const tools = [...ASK_TOOLS, ...sections.tools, ...Builder.tools];
 
     for (let turn = 0; turn < 12 && !closed; turn++) {
       const stream = client.beta.messages.stream({
@@ -355,7 +433,7 @@ app.post("/ask", auth, async (req, res) => {
         thinking: { type: "adaptive", display: "summarized" },
         output_config: { effort: "high" },
         system,
-        tools: ASK_TOOLS,
+        tools,
         messages,
       });
       stream.on("text", (t) => { if (!closed) send({ type: "text", text: t }); });
@@ -370,8 +448,18 @@ app.post("/ask", auth, async (req, res) => {
 
       const results = [];
       for (const b of msg.content) {
-        if (b.type !== "tool_use" || b.name !== "get_health_data") continue;
+        if (b.type !== "tool_use") continue;
         const input = b.input || {};
+        if (b.name !== "get_health_data") {
+          send({ type: "status", text: b.name === "save_kpi_section" ? `Saving section “${input.name || ""}”…` : b.name === "record_values" ? `Recording ${(input.rows || []).length} date(s) of results…`
+            : b.name === "create_derived_metric" ? `Building “${input.name || ""}” and calculating it over your history…` : b.name === "set_alert" ? `Setting alert “${input.label || ""}”…` : b.name === "set_goal" ? `Setting goal “${input.label || ""}”…` : "Preparing for your approval…" });
+          try {
+            const out = await Builder.runTool(b.name, input, (ev) => { if (!closed) send(ev); });
+            results.push({ type: "tool_result", tool_use_id: b.id, content: JSON.stringify(out ?? { error: "unknown tool" }), ...(out ? {} : { is_error: true }) });
+            if (out) send({ type: "sections" });
+          } catch (e) { results.push({ type: "tool_result", tool_use_id: b.id, content: "Error: " + e.message, is_error: true }); }
+          continue;
+        }
         send({ type: "status", text: `Looking at ${(input.metrics || []).slice(0, 4).join(", ")}${(input.metrics || []).length > 4 ? "…" : ""} (${input.granularity}${input.start ? `, ${input.start} → ${input.end || "today"}` : ""})` });
         try {
           results.push({ type: "tool_result", tool_use_id: b.id, content: JSON.stringify(queryMetrics(days, input)) });
@@ -388,7 +476,7 @@ app.post("/ask", auth, async (req, res) => {
       : e instanceof AnthropicClient.RateLimitError ? "Rate limited by Anthropic. Try again in a minute."
       : e instanceof AnthropicClient.APIError ? `AI error ${e.status}: ${e.message}` : e.message;
     console.error("/ask error:", e.message);
-    send({ type: "error", text: msg });
+    send({ type: "error", text: msg, ...(e.code === "credits_needed" ? { code: e.code } : {}) });
   }
   res.end();
 });
@@ -418,7 +506,7 @@ const CsvMapping = z.object({
   columns: z.array(z.object({
     header: z.string(),
     action: z.enum(["metric", "custom", "ignore"]),
-    key: z.string().describe("For action=metric: one of the BioTrack keys. Otherwise empty."),
+    key: z.string().describe("For action=metric: one of the BodyData keys. Otherwise empty."),
     label: z.string().describe("For action=custom: short human label. Otherwise empty."),
     unit: z.string().describe("Unit after conversion, e.g. lbs, %, kcal, min, bpm. Empty if none."),
     multiply: z.number().describe("Factor to convert the raw value to the unit (e.g. kg→lbs 2.20462, seconds→hours 0.000277778, fraction→% 100). 1 if none."),
@@ -428,17 +516,18 @@ const CsvMapping = z.object({
 
 async function aiMapCSV(headers, sample, filename) {
   const { anthropicKey } = await getCoachingSettings();
-  if (!anthropicKey) throw new Error("This file format is new to BioTrack, and mapping it needs an Anthropic API key (AI Coach settings).");
-  const client = new AnthropicClient({ apiKey: anthropicKey });
-  const response = await client.messages.parse({
+  if (!anthropicKey) throw new Error("This file format is new to BodyData, and mapping it needs an Anthropic API key (AI Coach settings).");
+  await Usage.checkBudget();
+  const client = Usage.client(anthropicKey, "csv_map");
+  const response = await client.messages.stream({
     model: ASK_MODEL,
     max_tokens: 16000,
     output_config: { effort: "low", format: zodOutputFormat(CsvMapping) },
     messages: [{ role: "user", content:
-      `Map this health/fitness export into BioTrack daily metrics.\nFile: ${filename}\nHeaders: ${JSON.stringify(headers)}\nFirst rows:\n${sample.map(r => JSON.stringify(r)).join("\n")}\n\n` +
-      `Use action=metric with one of these BioTrack keys when a column clearly matches (convert units with multiply): ${MAPPABLE_KEYS}.\n` +
+      `Map this health/fitness export into BodyData daily metrics.\nFile: ${filename}\nHeaders: ${JSON.stringify(headers)}\nFirst rows:\n${sample.map(r => JSON.stringify(r)).join("\n")}\n\n` +
+      `Use action=metric with one of these BodyData keys when a column clearly matches (convert units with multiply): ${MAPPABLE_KEYS}.\n` +
       `Use action=custom for any other useful numeric health/fitness column. Use action=ignore for ids, text, notes, and the date column itself.` }],
-  });
+  }).finalMessage();
   if (!response.parsed_output) throw new Error("AI couldn't map this file's columns.");
   return response.parsed_output;
 }
@@ -493,7 +582,7 @@ app.post("/import/file", auth, async (req, res) => {
     const fresh = days.filter(d => d.date >= cutoff);
     const now = new Date().toISOString();
     for (const d of fresh) await dbInsertSnapshot({ ...d.snapshot, _receivedAt: now, _id: crypto.randomUUID() });
-    _daysCache = { at: 0, days: null };
+    _daysCacheReset();
     const newest = days.length ? days[days.length - 1].date : meta[key + "_newest"];
     await dbSetMeta({ [key + "_last"]: now, [key + "_newest"]: newest, [key + "_days"]: days.length, [key + "_name"]: source });
     console.log(`[import] ${source}: ${fresh.length} of ${days.length} days stored (newest ${newest})`);
@@ -531,42 +620,58 @@ app.get("/sources", auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /export — full backup of every table (auth). Streams JSON so large tables don't buffer in memory.
+// GET /export — everything this user owns (their data export / backup). Streams JSON so large tables don't buffer.
+const EXPORT_TABLES = [["snapshots", "user_id"], ["meta", "user_id"], ["user_profiles", "user_id"], ["feedback", "user_id"]];
 app.get("/export", auth, async (req, res) => {
   try {
-    const { rows: tables } = await pool.query(`SELECT table_name FROM information_schema.tables WHERE table_schema='public' ORDER BY 1`);
+    const uid = currentUser();
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Content-Disposition", `attachment; filename="bodydata-export-${new Date().toISOString().slice(0,10)}.json"`);
     res.write(`{"exportedAt":${JSON.stringify(new Date().toISOString())},"tables":{`);
-    for (let t = 0; t < tables.length; t++) {
-      const name = tables[t].table_name;
+    for (let t = 0; t < EXPORT_TABLES.length; t++) {
+      const [name, col] = EXPORT_TABLES[t];
       res.write(`${t ? "," : ""}${JSON.stringify(name)}:[`);
       let offset = 0, first = true;
       for (;;) {
-        const { rows } = await pool.query(`SELECT * FROM "${name.replace(/"/g, "")}" ORDER BY 1 LIMIT 2000 OFFSET $1`, [offset]);
-        for (const r of rows) { res.write((first ? "" : ",") + JSON.stringify(r)); first = false; }
+        const { rows } = await pool.query(`SELECT * FROM ${name} WHERE ${col} = $2 ORDER BY 1 LIMIT 2000 OFFSET $1`, [offset, uid]).catch(() => ({ rows: [] }));
+        for (const r of rows) {
+          if (name === "meta" && /secret|key|pass|token/i.test(r.key)) continue;   // never export credentials
+          res.write((first ? "" : ",") + JSON.stringify(r)); first = false;
+        }
         if (rows.length < 2000) break; offset += 2000;
       }
       res.write("]");
     }
     res.end("}}");
-  } catch (e) { console.error("/export error:", e.message); if (!res.headersSent) res.status(500).json({ error: e.message }); else res.end(); }
+  } catch (e) { if (!res.headersSent) res.status(500).json({ error: e.message }); else res.end(); }
 });
 
 // GET/POST /prefs — dashboard layout (card order + hidden KPIs), shared by every device
 app.get("/prefs", auth, async (req, res) => {
-  try { const meta = await dbGetMeta(); res.json(meta.dashboard_prefs || {}); }
+  try { const meta = await dbGetMeta(); const p = await profileApi.getProfile(); res.json({ ...(meta.dashboard_prefs || {}), profile: p.sex || p.birthYear ? { sex: p.sex || null, birthYear: p.birthYear || null } : (meta.dashboard_prefs?.profile || null) }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post("/prefs", auth, async (req, res) => {
   try {
-    const { kpiOrder, kpiHidden } = req.body || {};
+    const { kpiOrder, kpiHidden, profile, benchmarkOptIn } = req.body || {};
+    const prev = (await dbGetMeta()).dashboard_prefs || {};
+    // Benchmarks: sex + birth year pick the cohort; opt-in decides whether this user counts in crowd stats
+    if (profile !== undefined || benchmarkOptIn !== undefined) {
+      const p = profile || prev.profile || {};
+      const next = { ...prev,
+        profile: { sex: ["male", "female"].includes(p.sex) ? p.sex : null, birthYear: Math.min(2015, Math.max(1920, parseInt(p.birthYear) || 0)) || null },
+        benchmarkOptIn: benchmarkOptIn === undefined ? !!prev.benchmarkOptIn : !!benchmarkOptIn, updatedAt: new Date().toISOString() };
+      await dbSetMeta({ dashboard_prefs: next });
+      // keep the per-user profile in step (benchmarks cohort lives there now)
+      if (profile) { const cur = await profileApi.getProfile(); await pool.query(`INSERT INTO user_profiles (user_id, data) VALUES ($2, $1) ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`, [JSON.stringify({ ...cur, ...next.profile }), currentUser()]); }
+      return res.json({ ok: true, ...next });
+    }
     const order = {};
     if (kpiOrder && typeof kpiOrder === "object" && !Array.isArray(kpiOrder))
       for (const [g, ids] of Object.entries(kpiOrder).slice(0, 60))
         if (Array.isArray(ids)) order[String(g).slice(0, 60)] = ids.slice(0, 400).map(x => String(x).slice(0, 120));
     const hidden = Array.isArray(kpiHidden) ? kpiHidden.slice(0, 1000).map(x => String(x).slice(0, 120)) : [];
-    const prefs = { kpiOrder: order, kpiHidden: hidden, updatedAt: new Date().toISOString() };
+    const prefs = { ...prev, kpiOrder: order, kpiHidden: hidden, updatedAt: new Date().toISOString() };
     await dbSetMeta({ dashboard_prefs: prefs });
     res.json({ ok: true, ...prefs });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -601,7 +706,7 @@ app.post("/automations", auth, async (req, res) => {
 app.get("/latest", auth, async (req, res) => {
   try {
     const latest = await dbGetLatest();
-    if (!latest) return res.status(404).json({ error: "No data yet — open BioTrack Health on iPhone and tap Sync Now" });
+    if (!latest) return res.status(404).json({ error: "No data yet — open BodyData.AI on your iPhone and tap Sync Now" });
     res.json(latest);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -697,8 +802,8 @@ app.post("/nutrition", auth, async (req, res) => {
 
     // Find the most recent snapshot for this date
     const { rows } = await pool.query(
-      `SELECT id, data FROM snapshots WHERE sync_date = $1 ORDER BY received_at DESC LIMIT 1`,
-      [targetDate]
+      `SELECT id, data FROM snapshots WHERE sync_date = $1 AND user_id = $2 ORDER BY received_at DESC LIMIT 1`,
+      [targetDate, currentUser()]
     );
 
     const nutritionFields = {
@@ -727,7 +832,7 @@ app.post("/nutrition", auth, async (req, res) => {
       // Patch existing snapshot
       const existing = rows[0].data;
       const updated  = { ...existing, ...nutritionFields, _nutritionUpdatedAt: new Date().toISOString() };
-      await pool.query(`UPDATE snapshots SET data = $1 WHERE id = $2`, [JSON.stringify(updated), rows[0].id]);
+      await pool.query(`UPDATE snapshots SET data = $1 WHERE id = $2 AND user_id = $3`, [JSON.stringify(updated), rows[0].id, currentUser()]);
       console.log(`[nutrition] Patched ${targetDate} snapshot (id ${rows[0].id}) with ${Object.keys(nutritionFields).length} fields`);
       return res.json({ ok: true, action: "patched", date: targetDate, fields: Object.keys(nutritionFields) });
     } else {
@@ -770,7 +875,7 @@ app.get("/health", async (_req, res) => {
 // GET /
 app.get("/", (_req, res) => {
   res.json({
-    name: "BioTrack API",
+    name: "BodyData API",
     version: "2.2.0",
     storage: "postgresql",
     routes: {
@@ -803,23 +908,11 @@ const { Resend } = require("resend");
 
 async function callClaude(prompt, systemPrompt, key) {
   if (!key) throw new Error("Anthropic API key not configured");
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4-5",
-      max_tokens: 2000,
-      system: systemPrompt,
-      messages: [{ role: "user", content: prompt }],
-    }),
+  const msg = await Usage.client(key, "coaching").messages.create({
+    model: ASK_MODEL, max_tokens: 8000, output_config: { effort: "low" },
+    system: systemPrompt, messages: [{ role: "user", content: prompt }],
   });
-  const j = await r.json();
-  if (j.error) throw new Error(j.error.message);
-  return j.content[0].text;
+  return msg.content.filter(b => b.type === "text").map(b => b.text).join("\n").trim();
 }
 
 async function sendPushNotification(title, body, topic) {
@@ -847,7 +940,7 @@ async function sendCoachingEmail(subject, htmlContent, textContent, cfg) {
       auth: { user: gmailUser, pass: gmailPass },
     });
     await transporter.sendMail({
-      from: `"BioTrack Coach" <${gmailUser}>`,
+      from: `"BodyData" <${gmailUser}>`,
       to: toEmail,
       subject,
       html: htmlContent,
@@ -861,7 +954,7 @@ async function sendCoachingEmail(subject, htmlContent, textContent, cfg) {
   if (resendKey) {
     const resend = new Resend(resendKey);
     await resend.emails.send({
-      from: "BioTrack Coach <coach@sellmore.me>",
+      from: "BodyData <coach@sellmore.me>",
       to: toEmail,
       subject,
       html: htmlContent,
@@ -990,7 +1083,7 @@ function buildEmailHtml(coachingText, today) {
       ${paragraphs}
     </div>
     <div style="text-align:center;font-size:11px;color:#444444;padding-top:16px;border-top:1px solid #222222">
-      BioTrack · Your personal health AI · <a href="https://biotrack-dashboard.vercel.app" style="color:#888888">View Dashboard</a>
+      BodyData · Your personal health AI · <a href="https://biotrack-dashboard.vercel.app" style="color:#888888">View Dashboard</a>
     </div>
   </div>
 </body></html>`;
@@ -1012,8 +1105,10 @@ HARD GOALS (non-negotiable targets):
 
 async function getCoachingSettings() {
   const meta = await dbGetMeta();
+  // The Anthropic key is BodyData's own (system-wide): env, else the owner's saved setting
+  const sys = currentUser() === OWNER ? meta : await dbGetMeta(OWNER);
   return {
-    anthropicKey: meta.coaching_anthropic_key  || process.env.ANTHROPIC_API_KEY  || null,
+    anthropicKey: sys.coaching_anthropic_key || process.env.ANTHROPIC_API_KEY || null,
     email:        meta.coaching_email          || process.env.COACHING_EMAIL      || null,
     resendKey:    meta.coaching_resend_key     || process.env.RESEND_API_KEY      || null,
     gmailUser:    meta.coaching_gmail_user     || process.env.GMAIL_USER          || null,
@@ -1151,14 +1246,14 @@ async function runDailyCoaching(session = "morning") {
         midday:  `☀️ 12PM Check-In — ${nowDate}`,
         evening: `🌙 5PM Recap — ${nowDate}`,
       };
-      await sendPushNotification(titles[session] || "BioTrack Coach", preview, cfg.ntfyTopic);
+      await sendPushNotification(titles[session] || "BodyData Coach", preview, cfg.ntfyTopic);
     }
 
     // Email — full formatted version
     const subjects = {
-      morning: `🌅 BioTrack 5AM Brief — ${nowDate}`,
-      midday:  `☀️ BioTrack 12PM Check-In — ${nowDate}`,
-      evening: `🌙 BioTrack 5PM Recap — ${nowDate}`,
+      morning: `🌅 BodyData 5AM Brief — ${nowDate}`,
+      midday:  `☀️ BodyData 12PM Check-In — ${nowDate}`,
+      evening: `🌙 BodyData 5PM Recap — ${nowDate}`,
     };
     await sendCoachingEmail(subjects[session], buildEmailHtml(coaching, today), coaching, cfg);
 
@@ -1178,6 +1273,8 @@ async function runDailyCoaching(session = "morning") {
 
 // POST /coaching/run — manually trigger (auth required). ?session=morning|evening
 app.post("/coaching/run", auth, async (req, res) => {
+  // The 3x-daily coaching prompts are written for the owner's own goals; other users get the weekly review
+  if (req.userId !== OWNER) return res.status(403).json({ error: "Daily coaching isn't available yet. Your weekly review is in Ask AI." });
   try {
     const session = req.query.session || req.body.session || "morning";
     await runDailyCoaching(session);
@@ -1211,80 +1308,7 @@ app.get("/coaching/latest", auth, async (req, res) => {
 // USER / COMMUNITY ROUTES  (multi-user support)
 // ─────────────────────────────────────────────────────────────────
 
-// Lightweight Clerk JWT verification using JWKS
-async function verifyClerkJWT(token) {
-  if (!token) return null;
-  try {
-    const [headerB64] = token.split(".");
-    const header = JSON.parse(Buffer.from(headerB64, "base64url").toString());
-    const kid = header.kid;
-    // Fetch JWKS from Clerk
-    const clerkDomain = process.env.CLERK_DOMAIN || "";
-    if (!clerkDomain) return null;
-    const jwksRes = await fetch(`https://${clerkDomain}/.well-known/jwks.json`);
-    const { keys } = await jwksRes.json();
-    const jwk = keys.find(k => k.kid === kid);
-    if (!jwk) return null;
-    // Import key and verify
-    const { createVerify } = require("crypto");
-    const { createPublicKey } = require("crypto");
-    const publicKey = createPublicKey({ key: jwk, format: "jwk" });
-    const [hdr, payload, sig] = token.split(".");
-    const data = `${hdr}.${payload}`;
-    const verify = createVerify("RSA-SHA256");
-    verify.update(data);
-    const valid = verify.verify(publicKey, sig, "base64url");
-    if (!valid) return null;
-    const claims = JSON.parse(Buffer.from(payload, "base64url").toString());
-    if (claims.exp && claims.exp < Math.floor(Date.now() / 1000)) return null;
-    return claims;
-  } catch { return null; }
-}
-
-// POST /users/upsert — create or update user from Clerk session
-app.post("/users/upsert", async (req, res) => {
-  try {
-    const authHeader = req.headers["authorization"] || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const claims = await verifyClerkJWT(token);
-    // Fallback: allow legacy secret for Brandon's own account migration
-    const isLegacy = !claims && req.headers["x-api-secret"] === SECRET;
-    if (!claims && !isLegacy) return res.status(401).json({ error: "Unauthorized" });
-
-    const userId = claims ? claims.sub : "legacy_brandon";
-    const { username, display_name, is_public, avatar_url } = req.body;
-
-    // Get email from claims
-    const email = claims?.email || claims?.primary_email_address || req.body.email || `${userId}@biotrack.app`;
-
-    await pool.query(`
-      INSERT INTO users (id, email, username, display_name, avatar_url, is_public)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (id) DO UPDATE SET
-        email        = EXCLUDED.email,
-        username     = COALESCE(NULLIF(EXCLUDED.username,''), users.username),
-        display_name = COALESCE(NULLIF(EXCLUDED.display_name,''), users.display_name),
-        avatar_url   = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
-        is_public    = EXCLUDED.is_public
-    `, [userId, email, username||null, display_name||null, avatar_url||null, is_public||false]);
-
-    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [userId]);
-    res.json({ ok: true, user: rows[0] });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET /users/me — return own profile
-app.get("/users/me", async (req, res) => {
-  try {
-    const authHeader = req.headers["authorization"] || "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const claims = await verifyClerkJWT(token);
-    if (!claims) return res.status(401).json({ error: "Unauthorized" });
-    const { rows } = await pool.query("SELECT * FROM users WHERE id=$1", [claims.sub]);
-    if (!rows.length) return res.status(404).json({ error: "User not found" });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+// Sign-in (Clerk sessions, per-user keys) lives in tenancy.js: GET /me, /keys.
 
 // GET /community — list all public users + their latest snapshot summary
 app.get("/community", async (_req, res) => {
@@ -1366,27 +1390,29 @@ app.use((err, _req, res, _next) => {
 dbInit()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`\n⬡ BioTrack API v2.2 — port ${PORT}`);
+      Jobs.start();
+      console.log(`\n⬡ BodyData API v2.2 — port ${PORT}`);
       console.log(`  Storage: PostgreSQL`);
       console.log(`  SECRET_KEY: set (${SECRET.length} chars)`);
       console.log(`  CORS: ${ALLOWED.join(", ") || "all"}`);
 
       // ── 3 daily coaching sessions — schedule read from DB so /coaching/settings changes take effect on redeploy
-      getCoachingSettings().then(cfg => {
+      // Coaching emails/pushes are the owner's personal setup (per-user coaching comes with accounts)
+      runAs(OWNER, () => getCoachingSettings()).then(cfg => {
         const cronAM = cfg.cronMorning;
         const cronMD = cfg.cronMidday;
         const cronPM = cfg.cronEvening;
         cron.schedule(cronAM, () => {
           console.log("[cron] morning brief");
-          runDailyCoaching("morning");
+          runAs(OWNER, () => runDailyCoaching("morning"));
         }, { timezone: "UTC" });
         cron.schedule(cronMD, () => {
           console.log("[cron] midday check-in");
-          runDailyCoaching("midday");
+          runAs(OWNER, () => runDailyCoaching("midday"));
         }, { timezone: "UTC" });
         cron.schedule(cronPM, () => {
           console.log("[cron] evening recap");
-          runDailyCoaching("evening");
+          runAs(OWNER, () => runDailyCoaching("evening"));
         }, { timezone: "UTC" });
         console.log(`  🌅 Morning brief:    ${cronAM} UTC`);
         console.log(`  ☀️  Midday check-in: ${cronMD} UTC`);
