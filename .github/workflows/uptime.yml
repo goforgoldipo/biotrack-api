@@ -1,0 +1,25 @@
+# Checks the BodyData API every 15 minutes from outside Railway and pushes to the
+# owner's phone (ntfy) when it's down. Repo secret: NTFY_TOPIC.
+name: uptime
+on:
+  schedule: [{ cron: "*/15 * * * *" }]
+  workflow_dispatch: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check /health (3 tries)
+        id: h
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o body.json -w "%{http_code}" -m 20 https://biotrack-api-production.up.railway.app/health || echo 000)
+            if [ "$code" = "200" ] && grep -q '"status":"ok"' body.json; then echo "up"; exit 0; fi
+            sleep 30
+          done
+          echo "code=$code" >> "$GITHUB_OUTPUT"; exit 1
+      - name: Alert
+        if: failure()
+        env: { TOPIC: "${{ secrets.NTFY_TOPIC }}" }
+        run: |
+          curl -s -H "Title: ⚠️ BodyData API is down" -H "Priority: high" -d "Health check failed 3 times (HTTP ${{ steps.h.outputs.code }}). Check Railway." "https://ntfy.sh/$TOPIC"
