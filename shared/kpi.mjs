@@ -551,7 +551,7 @@ export function buildKpiBoard(allData, r, sections = []) {
       const get = s => { const x = idx.get(s)?.[row.k]; return typeof x === "number" && isFinite(x) ? x : null; };
       const cur = days.map(get), prv = cdays.map(get);
       const value = aggVals(cur, mode), prev = aggVals(prv, mode);
-      const pts = unit === "%";
+      const pts = false;   // change badges always show % change (body fat 20 → 18.5 = −7.5%), never percentage points
       const delta = value != null && prev != null ? (pts ? value - prev : prev !== 0 ? (value - prev) / Math.abs(prev) * 100 : null) : null;
       const vals = buckets.map(b => aggVals(b.days.map(get), mode));
       const curPts = days.map((s, i) => [s, cur[i]]).filter(p => p[1] != null);
