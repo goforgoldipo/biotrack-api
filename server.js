@@ -188,6 +188,7 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "x-api-secret", "Authorization"],
 }));
 app.use(express.json({ limit: "25mb" }));   // CSV exports are sent as JSON text
+app.use(require("./events").middleware);   // product events (no health values); off without POSTHOG_KEY
 
 // ── Auth
 T = Tenancy({ pool, SECRET });

@@ -96,7 +96,8 @@ module.exports = function tenancy({ pool, SECRET }) {
       if (r.rows[0]) return OWNER;
     }
     if (admission && !(await admission(email))) { const e = new Error("BodyData is invite-only during the beta. You're on the waitlist and we'll email you when there's a spot."); e.code = "waitlist"; throw e; }
-    await pool.query(`INSERT INTO users (id, email, clerk_id) VALUES ($1, $2, $1) ON CONFLICT (id) DO NOTHING`, [c.sub, email || `${c.sub}@users.bodydata.ai`]);
+    const ins = await pool.query(`INSERT INTO users (id, email, clerk_id) VALUES ($1, $2, $1) ON CONFLICT (id) DO NOTHING`, [c.sub, email || `${c.sub}@users.bodydata.ai`]);
+    if (ins.rowCount) require("./events").capture(c.sub, "signed_up", { $set_once: { signed_up_at: new Date().toISOString() } });
     return c.sub;
   }
   async function userForKey(key) {
