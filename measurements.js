@@ -21,26 +21,27 @@ const KEYS = new Set(SITES.map(s => s[0]));
 const RANGE = (k) => /neck/i.test(k) ? [8, 30] : /Bicep|Forearm|Calf/.test(k) ? [4, 30] : /Thigh/.test(k) ? [10, 45] : [15, 75];
 const r2 = (x) => Math.round(x * 100) / 100;
 
-const TOOL = {
-  name: "record_measurements",
-  description: "Record the body circumference measurements found in the user's text, photo or document.",
-  input_schema: {
-    type: "object",
-    properties: {
-      date: { type: ["string", "null"], description: "Date the measurements were TAKEN, YYYY-MM-DD, if stated or clearly implied (e.g. the email date the report was sent). null if unknown." },
-      unit: { type: "string", enum: ["cm", "in"], description: "Unit the numbers are written in." },
-      source: { type: ["string", "null"], description: "Who/what took them, e.g. 'DexaFit', 'Tape measure', 'Coach'. null if unknown." },
-      values: {
-        type: "object", additionalProperties: false,
-        description: "Circumference per site in `unit`. Use left/right keys when sides are given; if only one value is given for a paired site, put it in BOTH sides only when the text says it applies to both, otherwise in the right side. Omit sites that aren't measured.",
-        properties: Object.fromEntries(SITES.map(([k, l]) => [k, { type: "number", description: l }])),
-      },
-      notes: { type: "object", additionalProperties: { type: "string" }, description: "Landmark notes per key, e.g. { neckIn: 'Above Adam's apple' }." },
-      unrecognized: { type: "array", items: { type: "string" }, description: "Measurements present that don't fit any key (e.g. 'Wrist 17 cm')." },
-    },
-    required: ["unit", "values"],
+// Structured output (Opus 5.5 doesn't allow forced tool_choice). Every field required; null = not given.
+const NUM_OR_NULL = { anyOf: [{ type: "number" }, { type: "null" }] };
+const SCHEMA = {
+  type: "object", additionalProperties: false,
+  properties: {
+    date: { anyOf: [{ type: "string" }, { type: "null" }] },
+    unit: { type: "string", enum: ["cm", "in"] },
+    source: { anyOf: [{ type: "string" }, { type: "null" }] },
+    values: { type: "object", additionalProperties: false, properties: Object.fromEntries(SITES.map(([k]) => [k, NUM_OR_NULL])), required: SITES.map(s => s[0]) },
+    notes: { type: "array", items: { type: "object", additionalProperties: false, properties: { key: { type: "string" }, note: { type: "string" } }, required: ["key", "note"] } },
+    unrecognized: { type: "array", items: { type: "string" } },
   },
+  required: ["date", "unit", "source", "values", "notes", "unrecognized"],
 };
+const INSTRUCTIONS = `Read the body circumference measurements in the content above and return JSON.
+- date: when the measurements were TAKEN as YYYY-MM-DD if stated or clearly implied (e.g. the date on the report or email), else null.
+- unit: the unit the numbers are written in ("cm" or "in"). Copy the numbers exactly; don't convert.
+- source: who or what took them (e.g. "DexaFit", "Tape measure", "Coach"), else null.
+- values: one number per site, null if not measured. Keys: ${SITES.map(([k, l]) => `${k} = ${l}`).join(", ")}. Use left/right keys when sides are given. When a paired site has one number, put it in both sides only if the text says it applies to both; otherwise use the right side.
+- notes: landmark descriptions per key, e.g. {key:"neckIn", note:"Above Adam's apple"}.
+- unrecognized: measurements present that don't fit any key, e.g. "Wrist 17 cm".`;
 
 module.exports = function measurements(app, { auth, pool, Usage, getKey, invalidate, model }) {
   // ── AI read → draft (nothing stored) ──
@@ -60,19 +61,21 @@ module.exports = function measurements(app, { auth, pool, Usage, getKey, invalid
       if (!key) return res.status(503).json({ error: "AI is temporarily unavailable. Please try again later." });
       await Usage.checkBudget();
       const today = new Date().toISOString().slice(0, 10);
-      content.push({ type: "text", text: `Today is ${today}. Read the body measurements above and call record_measurements. Copy numbers exactly; don't convert units.` });
+      content.push({ type: "text", text: `Today is ${today}.\n${INSTRUCTIONS}` });
       const msg = await Usage.client(key, "measurements").messages.create({
-        model, max_tokens: 2000, tools: [TOOL], tool_choice: { type: "tool", name: TOOL.name },
+        model, max_tokens: 4000, output_config: { effort: "low", format: { type: "json_schema", schema: SCHEMA } },
         messages: [{ role: "user", content }],
       });
-      const out = msg.content.find(b => b.type === "tool_use")?.input;
+      let out = null;
+      try { out = JSON.parse(msg.content.filter(b => b.type === "text").map(b => b.text).join("")); } catch {}
       if (!out) return res.status(422).json({ error: "Couldn't find measurements in that. Try typing them in." });
       const f = out.unit === "cm" ? 1 / 2.54 : 1;
       const values = {}, original = {};
       for (const [k, v] of Object.entries(out.values || {})) if (KEYS.has(k) && typeof v === "number" && v > 0) { values[k] = r2(v * f); original[k] = v; }
       if (!Object.keys(values).length) return res.status(422).json({ error: "Couldn't find any measurements in that. Try typing them in." });
       const date = /^\d{4}-\d{2}-\d{2}$/.test(out.date || "") && out.date <= today ? out.date : null;
-      res.json({ draft: { date, unit: out.unit, values, original, source: out.source || null, notes: out.notes || {}, unrecognized: out.unrecognized || [] } });
+      const notes = Object.fromEntries((out.notes || []).filter(n => KEYS.has(n.key)).map(n => [n.key, n.note]));
+      res.json({ draft: { date, unit: out.unit, values, original, source: out.source || null, notes, unrecognized: out.unrecognized || [] } });
     } catch (e) { res.status(e.status === 429 ? 429 : 500).json({ error: e.message, code: e.code }); }
   });
 
