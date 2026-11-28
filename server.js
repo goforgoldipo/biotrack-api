@@ -188,7 +188,7 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "x-api-secret", "Authorization"],
 }));
 app.use(express.json({ limit: "25mb" }));   // CSV exports are sent as JSON text
-app.use(require("./events").middleware);   // product events (no health values); off without POSTHOG_KEY
+app.use(require("./events").middleware);   // usage tracking (no health values) → activity table (+ PostHog if keyed)
 
 // ── Auth
 T = Tenancy({ pool, SECRET });
@@ -380,6 +380,7 @@ const profileApi = require("./profile")(app, { auth, pool, dbGetMeta, loadDays, 
 require("./legal")(app, { auth, pool });
 require("./measurements")(app, { auth, pool, Usage, model: ASK_MODEL, invalidate: () => _daysCacheReset(), getKey: async () => (await getCoachingSettings()).anthropicKey });
 // Backups, owner alerts, invite-only sign-up
+require("./events").install(app, { auth, pool });
 const Ops = require("./ops")(app, { auth, pool,
   notify: async (title, body) => { const c = await runAs(OWNER, () => getCoachingSettings()); await sendPushNotification(title, body, c.ntfyTopic); } });
 T.setAdmission(Ops.admit);
