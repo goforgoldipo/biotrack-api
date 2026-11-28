@@ -377,6 +377,7 @@ const Review = require("./review")(app, { auth, dbGetMeta, dbSetMeta, loadDays: 
 const profileApi = require("./profile")(app, { auth, pool, dbGetMeta, loadDays, dedupHistory });
 // Terms/privacy consent (recorded per version) + permanent account deletion
 require("./legal")(app, { auth, pool });
+require("./measurements")(app, { auth, pool, Usage, model: ASK_MODEL, invalidate: () => _daysCacheReset(), getKey: async () => (await getCoachingSettings()).anthropicKey });
 // Backups, owner alerts, invite-only sign-up
 const Ops = require("./ops")(app, { auth, pool,
   notify: async (title, body) => { const c = await runAs(OWNER, () => getCoachingSettings()); await sendPushNotification(title, body, c.ntfyTopic); } });
